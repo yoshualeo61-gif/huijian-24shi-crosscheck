@@ -1,0 +1,16 @@
+# 語料：由 fetch 自行下載，不入倉庫
+china-history/
+corpus/
+
+# 工作目錄與產出
+work/
+out/
+*_findings.json
+*_report.txt
+!samples/*_findings.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
