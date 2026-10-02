@@ -14,6 +14,13 @@
 
 import argparse, html, json, os, pathlib, re, subprocess, sys, urllib.request
 
+# Windows 預設以本地代碼頁寫 stdout，一旦重定向到檔案，中文即 UnicodeEncodeError。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):     # 非 TextIOWrapper，或已被接管
+        pass
+
 REPO = "https://github.com/hunterhug/china-history.git"
 RAW = pathlib.Path("china-history")
 COR = pathlib.Path("corpus")
@@ -21,10 +28,12 @@ MODEL = "claude-sonnet-4-6"
 
 # ── 立場表：決定「單方獨載」怎麼算 ────────────────────────────
 STANCE = {
-    "宋书": "南朝系", "南齐书": "南朝系", "梁书": "南朝系",
-    "陈书": "南朝系", "南史": "南朝系",
-    "魏书": "北朝系", "北齐书": "北朝系", "周书": "北朝系", "北史": "北朝系",
-    "晋书": "唐修", "隋书": "唐修",
+    "宋书": "南朝系", "南齐书": "南朝系", "梁书": "南朝系", "陈书": "南朝系",
+    "魏书": "北朝系", "北齐书": "北朝系", "周书": "北朝系",
+    # 《南史》《北史》為李延壽唐修，係刪削《宋書》《南齊書》《魏書》等而成。
+    # 計入南／北朝系會把派生本當成獨立證人，虛增立場軸的獨立性，
+    # 獨載檢測與跨立場對齊都會因此失真。
+    "南史": "唐修", "北史": "唐修", "晋书": "唐修", "隋书": "唐修",
     "旧唐书": "五代宋修", "新唐书": "五代宋修",
     "旧五代史": "宋修", "新五代史": "宋修", "宋史": "元修",
     "辽史": "元修", "金史": "元修", "元史": "明修", "明史": "清修",
@@ -106,11 +115,16 @@ def scan(terms, window=200):
             for m in re.finditer(re.escape(t), s):
                 a, b = max(0, m.start() - window), min(len(s), m.end() + window)
                 ctx = re.sub(r"\s+", "", s[a:b])
-                k = ctx[:45]
+                juan = re.sub(r"-原文|第.+?章-|原文版|段译", "", f.stem)
+                # 去重限於同一部書之內：摺疊重疊的檢索窗口，以及語料裡
+                # 卷名不同而內容相同的重複檔（如 南史_卷一 與 南史_-卷一）。
+                # 不可做成全局 key——《南史》刪削《宋書》而成，成段雷同者
+                # 只會留下排序在前的那一本，被丟掉的往往正是原始史源，
+                # 交叉比對因此少掉一方，並誤報「單方獨載」。
+                k = (book, ctx[:45])
                 if k in seen:
                     continue
                 seen.add(k)
-                juan = re.sub(r"-原文|第.+?章-|原文版|段译", "", f.stem)
                 hits.append((book, juan, STANCE.get(book, "?"), t, ctx))
     return hits
 
@@ -448,7 +462,7 @@ def main():
         q.set_defaults(fn=fn)
 
     a = ap.parse_args()
-    if a.cmd != "fetch" and not COR.exists():
+    if a.cmd not in ("fetch", "verify") and not COR.exists():
         sys.exit("先跑 python huijian.py fetch")
     a.fn(a)
 

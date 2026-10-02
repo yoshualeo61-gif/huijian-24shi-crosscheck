@@ -12,6 +12,13 @@
 
 import argparse, itertools, json, re, sys
 
+# Windows 預設以本地代碼頁寫 stdout，重定向到檔案時中文即 UnicodeEncodeError。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 # ── 年號表 ────────────────────────────────────────────────
 # (年號, 元年公元, 立場)。可續補；未收之年號換算返回 None，不猜。
 ERAS = [
@@ -40,7 +47,40 @@ ERAS = [
     ("永安", 528, "北"), ("普泰", 531, "北"), ("太昌", 532, "北"),
     ("永熙", 532, "北"),
 ]
+# 同名年號：歷代重用，字面完全相同。只收一個元年會把另一朝的紀年
+# 悄悄換算成相差一兩百年的公元數，而錯誤的年份還會在 pair_score 裡
+# 加 3 分，憑空造出「同年」錨定。收齊各自元年，交給 BOOK_SPAN 消歧。
+ERAS += [
+    ("建元", -140, "西漢"), ("建元", 343, "東晉"),
+    ("建武", 25, "東漢"), ("建武", 317, "東晉"),
+    ("永平", 58, "東漢"),
+    ("永元", 89, "東漢"),
+    ("永初", 107, "東漢"),
+    ("和平", 150, "東漢"),
+    ("元嘉", 151, "東漢"),
+    ("太和", 227, "曹魏"),
+    ("正始", 240, "曹魏"),
+    ("泰始", 265, "西晉"),
+    ("永熙", 290, "西晉"),
+    ("太安", 302, "西晉"),
+    ("永安", 304, "西晉"),
+]
 ERAS.sort(key=lambda e: -len(e[0]))          # 長年號優先，免得「大通」吃掉「中大通」
+
+# 各書記事大致起訖（公元），僅用於同名年號消歧。寬鬆取界，
+# 只求排除百年量級的誤判，不作精確斷限。
+BOOK_SPAN = {
+    "史记": (-2100, -90), "汉书": (-206, 23), "后汉书": (25, 220),
+    "三国志": (184, 280), "晋书": (220, 420),
+    "宋书": (420, 479), "南齐书": (479, 502), "梁书": (502, 557),
+    "陈书": (557, 589), "南史": (420, 589),
+    "魏书": (386, 550), "北齐书": (534, 577), "周书": (535, 581),
+    "北史": (386, 618), "隋书": (581, 618),
+    "旧唐书": (618, 907), "新唐书": (618, 907),
+    "旧五代史": (907, 960), "新五代史": (907, 960),
+    "宋史": (960, 1279), "辽史": (907, 1125), "金史": (1115, 1234),
+    "元史": (1206, 1368), "明史": (1368, 1644),
+}
 
 CN = {"元": 1, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
       "七": 7, "八": 8, "九": 9, "十": 10}
@@ -59,16 +99,39 @@ def cn_num(s):
     return None
 
 
-def to_year(text):
-    """『延昌二年』→ (513, '延昌', 2)。無法確定則 None —— 不猜。"""
+def era_candidates(text):
+    """字面匹配到的全部候選 [(公元, 年號, 第幾年)]。
+    同名年號歷代重用，故可能多於一個。ERAS 已按名長排序，長年號在前。"""
     if not text:
-        return None
+        return []
+    out = []
     for era, y0, _ in ERAS:
         m = re.search(re.escape(era) + r"([元一二三四五六七八九十]+)年", text)
         if m:
             n = cn_num(m.group(1))
             if n:
-                return (y0 + n - 1, era, n)
+                out.append((y0 + n - 1, era, n))
+    return out
+
+
+def to_year(text, book=None):
+    """『延昌二年』→ (513, '延昌', 2)。
+
+    同名年號（如《晉書》的泰始與《宋書》的泰始）靠來源書名消歧。
+    未收、無書名可據、或消歧後仍不唯一者返回 None —— 不猜。
+    """
+    cands = era_candidates(text)
+    if not cands:
+        return None
+    era = cands[0][1]                        # 取最長的那個年號名
+    same = [c for c in cands if c[1] == era]
+    if len(same) == 1:
+        return same[0]
+    lo, hi = BOOK_SPAN.get(book or "", (None, None))
+    if lo is not None:
+        fit = [c for c in same if lo <= c[0] <= hi]
+        if len(fit) == 1:
+            return fit[0]
     return None
 
 
@@ -93,7 +156,7 @@ def anchors(row):
     return {
         "person": row.get("person") or "",
         "place": row.get("place") or "",
-        "year": to_year(row.get("time", "")),
+        "year": to_year(row.get("time", ""), row.get("book")),
         "acts": set(row.get("acts") or []),
         "stance": row.get("stance", "?"),
     }
@@ -184,6 +247,7 @@ def main():
 
     e = sub.add_parser("eras", help="紀年換算")
     e.add_argument("terms", nargs="+")
+    e.add_argument("--book", help="來源書名，用於同名年號消歧，如 晋书")
 
     g = sub.add_parser("align", help="事件對照")
     g.add_argument("findings", help="huijian run 產出的 findings.json")
@@ -193,8 +257,17 @@ def main():
     a = ap.parse_args()
     if a.cmd == "eras":
         for t in a.terms:
-            y = to_year(t)
-            print(f"{t:16s} → {y[0]} 年（{y[1]}{y[2]}）" if y else f"{t:16s} → 未收，不猜")
+            y = to_year(t, a.book)
+            if y:
+                print(f"{t:16s} → {y[0]} 年（{y[1]}{y[2]}）")
+                continue
+            cs = era_candidates(t)
+            if not cs:
+                print(f"{t:16s} → 未收，不猜")
+            else:
+                opts = "／".join(str(c[0]) for c in cs if c[1] == cs[0][1])
+                print(f"{t:16s} → 同名年號「{cs[0][1]}」候選 {opts} —— 不猜"
+                      f"（加 --book 書名消歧）")
         return
 
     data = json.load(open(a.findings, encoding="utf-8"))
