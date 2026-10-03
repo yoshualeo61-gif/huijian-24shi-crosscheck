@@ -12,7 +12,8 @@
     python huijian.py run 郁洲 -o out/          # 全流程 (需 ANTHROPIC_API_KEY)
 """
 
-import argparse, html, json, os, pathlib, re, subprocess, sys, urllib.request
+import argparse, collections, html, json, os, pathlib, re, subprocess, sys
+import urllib.request
 
 # Windows 預設以本地代碼頁寫 stdout，一旦重定向到檔案，中文即 UnicodeEncodeError。
 for _s in (sys.stdout, sys.stderr):
@@ -46,6 +47,14 @@ ACTS = ["除授", "罢黜", "赴任", "征战", "战胜", "战败", "死于战",
         "逃亡", "受封赏"]
 TERMINAL = {"死于战", "病卒", "被杀", "归降", "被俘"}   # 任兩者並存＝硬矛盾
 PAIRS = [("战胜", "战败"), ("除授", "罢黜")]
+
+# 一個 chunk 可能由同卷中數個不相鄰的窗口拼成，接縫處插入此標記。
+# 校驗要求引文完整落在單一窗口內 —— 跨縫即拼接，一律丟棄。
+SEAM = "\n……【中略】……\n"
+
+# 命中項。start 是 ctx 在該卷正規化全文中的字元偏移，src 是該卷語料路徑；
+# 兩者合起來就是引文的可回查地址。
+Hit = collections.namedtuple("Hit", "book juan stance term ctx start src")
 
 
 # ── 語料 ──────────────────────────────────────────────────
@@ -103,18 +112,27 @@ def variants(term, extra=()):
     return sorted(out)
 
 
+def norm_text(p):
+    """卷的正規化全文：去掉所有空白，使字元偏移成為穩定的地址。"""
+    return re.sub(r"\s+", "", p.read_text(encoding="utf-8"))
+
+
 def scan(terms, window=200):
-    """回傳 [(書, 卷, 立場, 命中詞, 上下文)]，去重"""
+    """回傳 [Hit]，去重。
+
+    檢索在正規化全文上進行，故 start 是上下文在該卷正規化文本中的字元偏移。
+    這個偏移就是引文的地址，可據以重新切片核對。
+    """
     seen, hits = set(), []
     for f in sorted(COR.rglob("*.txt")):
         if any(w in f.name for w in ("译文", "譯文", "白话", "白話", "段译")):
             continue
         book = f.parts[1]
-        s = f.read_text(encoding="utf-8")
+        s = norm_text(f)
         for t in terms:
             for m in re.finditer(re.escape(t), s):
                 a, b = max(0, m.start() - window), min(len(s), m.end() + window)
-                ctx = re.sub(r"\s+", "", s[a:b])
+                ctx = s[a:b]
                 juan = re.sub(r"-原文|第.+?章-|原文版|段译", "", f.stem)
                 # 去重限於同一部書之內：摺疊重疊的檢索窗口，以及語料裡
                 # 卷名不同而內容相同的重複檔（如 南史_卷一 與 南史_-卷一）。
@@ -125,7 +143,8 @@ def scan(terms, window=200):
                 if k in seen:
                     continue
                 seen.add(k)
-                hits.append((book, juan, STANCE.get(book, "?"), t, ctx))
+                hits.append(Hit(book, juan, STANCE.get(book, "?"), t, ctx,
+                                a, f.as_posix()))
     return hits
 
 
@@ -135,11 +154,11 @@ def cmd_search(a):
     hits = scan(terms, a.window)
     by_stance = {}
     for h in hits:
-        by_stance.setdefault(h[2], []).append(h)
+        by_stance.setdefault(h.stance, []).append(h)
     for st, rows in sorted(by_stance.items(), key=lambda x: -len(x[1])):
         print(f"\n═══ {st} · {len(rows)} 段 ═══")
-        for bk, juan, _, t, ctx in rows:
-            print(f"\n【{bk}·{juan}】({t})\n …{ctx}…")
+        for h in rows:
+            print(f"\n【{h.book}·{h.juan}】({h.term} @{h.start})\n …{h.ctx}…")
     print(f"\n共 {len(hits)} 段", file=sys.stderr)
 
 
@@ -150,13 +169,13 @@ def cmd_dossier(a):
     out.mkdir(parents=True, exist_ok=True)
     groups = {}
     for h in hits:
-        groups.setdefault(h[2], []).append(h)
+        groups.setdefault(h.stance, []).append(h)
     for st, rows in groups.items():
         p = out / f"{a.term}_{st}.txt"
         with p.open("w", encoding="utf-8") as fh:
-            for bk, juan, _, _, ctx in rows:
-                fh.write(f"《{bk}·{juan}》\n…{ctx}…\n\n")
-        print(f"{p}  {len(rows)} 段  {sum(len(r[4]) for r in rows):,} 字")
+            for h in rows:
+                fh.write(f"《{h.book}·{h.juan}》@{h.start}\n…{h.ctx}…\n\n")
+        print(f"{p}  {len(rows)} 段  {sum(len(r.ctx) for r in rows):,} 字")
 
 
 # ── 模型層：只做抽取 ───────────────────────────────────────
@@ -167,6 +186,8 @@ EXTRACT_PROMPT = """你是史料抽取器。只抽取，不判断，不推论。
 2. evidence 必须是原文中逐字连续的片段，一字不改。
 3. 无可抽者返回 []。宁可空，不可凑。
 4. person 用原文出现的写法，不要自行补全姓氏。
+5. 史料中若出现「……【中略】……」，表示它前后的文字在原书里并不相邻。
+   evidence 不得跨越这个标记 —— 跨越即拼接，会被校验丢弃。
 
 acts 只能选自：{acts}
 
@@ -206,40 +227,128 @@ def chunks(text, n=1400):
 
 
 def extract(hits, key, limit=0, dry=False, debug=False):
-    """回傳 (rows, 攔截數)。逐字校驗是防杜撰的唯一硬保證。"""
+    """回傳 (rows, 攔截數)。偏移重切是防杜撰的硬保證。"""
     rows, dropped, calls = [], 0, 0
-    groups = {}
-    for bk, juan, st, _, ctx in hits:
-        groups.setdefault((bk, juan, st), []).append(ctx)
-    for i, ((bk, juan, st), ctxs) in enumerate(groups.items(), 1):
-        src = "\n".join(dict.fromkeys(ctxs))
-        for ck in chunks(src):
-            if limit and calls >= limit:
-                print(f"  達到 --limit {limit}，停止呼叫", file=sys.stderr)
-                return rows, dropped
-            calls += 1
-            print(f"  [{i}/{len(groups)}] {bk}·{juan}  ({len(ck)}字)", file=sys.stderr)
-            if dry:
-                continue
-            try:
-                items = call_api(EXTRACT_PROMPT.format(acts="、".join(ACTS), chunk=ck), key)
-            except Exception as e:
-                print(f"    ! API 失敗: {e}", file=sys.stderr)
-                continue
-            if debug:
-                print(f"    模型返回 {len(items)} 條", file=sys.stderr)
-            for it in items:
-                ev = (it.get("evidence") or "").strip()
-                if len(ev) >= 4 and ev in ck:          # ← 逐字校驗
-                    it["evidence"] = ev
-                    it.update(book=bk, juan=juan, stance=st)
-                    if it.get("person"):
-                        rows.append(it)
-                else:
-                    dropped += 1
-                    if debug:
-                        print(f"    ✗ 攔截: 「{ev[:30]}」不在原文", file=sys.stderr)
+    cks = _mkchunks(hits)
+    for c in cks:
+        if limit and calls >= limit:
+            print(f"  達到 --limit {limit}，停止呼叫", file=sys.stderr)
+            return rows, dropped
+        calls += 1
+        print(f"  [{c['ci'] + 1}/{len(cks)}] {c['book']}·{c['juan']}"
+              f"  ({len(c['chunk'])}字，{len(c['segments'])}段)", file=sys.stderr)
+        if dry:
+            continue
+        try:
+            items = call_api(
+                EXTRACT_PROMPT.format(acts="、".join(ACTS), chunk=c["chunk"]), key)
+        except Exception as e:
+            print(f"    ! API 失敗: {e}", file=sys.stderr)
+            continue
+        if debug:
+            print(f"    模型返回 {len(items)} 條", file=sys.stderr)
+        for it in items:
+            ev = (it.get("evidence") or "").strip()
+            loc = locate(ev, c)
+            if loc and it.get("person"):
+                it["evidence"] = ev
+                it.update(book=c["book"], juan=c["juan"], stance=c["stance"],
+                          src=c.get("src"), ev_start=loc[0], ev_end=loc[1])
+                rows.append(it)
+            else:
+                dropped += 1
+                if debug:
+                    print(f"    ✗ 攔截: 「{ev[:30]}」", file=sys.stderr)
     return rows, dropped
+
+
+# ── 校驗閘：按偏移重新切片 ────────────────────────────────
+def locate(ev, c):
+    """引文在原卷中的絕對地址 (start, end)，不合格返回 None。
+
+    要求引文完整落在單一 segment 之內。一個 chunk 可能由同卷中數個不相鄰的
+    窗口拼成，若引文橫跨接縫，它在 chunk 裡看似連續，在原書裡卻不是 ——
+    這正是子串測試 `ev in chunk` 攔不住的那一類拼接。
+    """
+    if len(ev) < 4:
+        return None
+    segs = c.get("segments")
+    if not segs:                      # 舊版 chunks.json 無偏移可據，退回子串測試
+        return (None, None) if ev in c.get("chunk", "") else None
+    for s in segs:
+        i = s["text"].find(ev)
+        if i >= 0:
+            return (s["start"] + i, s["start"] + i + len(ev))
+    return None
+
+
+def strict_check(r):
+    """從語料重新讀入該卷，按地址切片逐字比對。
+
+    回傳 True／False；缺語料或無偏移（舊資料）則 None，表示無從核對。
+    """
+    sp, a, b = r.get("src"), r.get("ev_start"), r.get("ev_end")
+    if not sp or a is None:
+        return None
+    p = pathlib.Path(sp)
+    if not p.exists():
+        return None
+    return norm_text(p)[a:b] == r["evidence"]
+
+
+# ── 人名歸一：只提候選，不自行合併 ────────────────────────
+def alias_candidates(rows):
+    """提出人名歸一候選。
+
+    抽取規格要求 person 照原文寫法，不補姓氏，於是《宋書》的「善明」與
+    《魏書》的「劉善明」會各自成條：跨立場比對因此落空，兩邊還都被記成
+    「單方獨載」。這裡用確定性規則提出候選 —— 短名是長名的真後綴，
+    且長名多出 1–3 字（姓氏的長度）。併與不併由人裁定。
+    """
+    forms = {}
+    for r in rows:
+        forms.setdefault(r["person"], []).append(r)
+    names = sorted(forms)
+
+    def where(n):
+        return sorted({f"{x['book']}·{x['juan']}" for x in forms[n]})
+
+    out = []
+    for short in names:
+        if len(short) < 2:
+            continue
+        longs = [n for n in names if n != short and n.endswith(short)
+                 and 1 <= len(n) - len(short) <= 3]
+        if not longs:
+            continue
+        shared = [n for n in longs if set(where(n)) & set(where(short))]
+        out.append({
+            "short": short,
+            "candidates": longs,
+            "suggest": longs[0] if len(longs) == 1 else None,
+            "ambiguous": len(longs) > 1,
+            "short_seen_in": where(short),
+            "candidate_seen_in": {n: where(n) for n in longs},
+            "same_juan_with": shared,
+            "why": ("短名為長名之真後綴，差 "
+                    + "／".join(str(len(n) - len(short)) for n in longs)
+                    + " 字（疑為姓氏）"
+                    + ("；且同卷共現，益可信" if shared else "")
+                    + ("；對上多個長名，須人工裁定" if len(longs) > 1 else "")),
+        })
+    return out
+
+
+def apply_aliases(rows, amap):
+    """amap 形如 {"善明": "劉善明"}。原寫法留在 person_raw，不丟失。"""
+    n = 0
+    for r in rows:
+        tgt = amap.get(r["person"])
+        if tgt and tgt != r["person"]:
+            r["person_raw"] = r["person"]
+            r["person"] = tgt
+            n += 1
+    return n
 
 
 # ── 確定性層：矛盾 / 歧異 / 獨載 ──────────────────────────
@@ -298,8 +407,10 @@ def analyse(rows, all_stances):
     return sorted(out, key=lambda x: -x["score"])
 
 
-def report(res, dropped, fh=sys.stdout):
+def report(res, dropped, fh=sys.stdout, note=""):
     print(f"\n{'='*64}\n人物 {len(res)}　攔下偽引 {dropped} 條\n{'='*64}", file=fh)
+    if note:
+        print(f"\n⚠ {note}\n", file=fh)
     for p in res:
         print(f"\n■ {p['person']}　[{'|'.join(p['stances'])}]　權重 {p['score']}", file=fh)
         for w, k, why in p["flags"]:
@@ -323,7 +434,7 @@ def cmd_run(a):
     if a.dry_run:
         print(f"\n--dry-run：本次會發出上列請求，未實際呼叫 API。", file=sys.stderr)
         return
-    res = analyse(rows, sorted({h[2] for h in hits}))
+    res = analyse(rows, sorted({h.stance for h in hits}))
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     json.dump(res, (out / f"{a.term}_findings.json").open("w", encoding="utf-8"),
@@ -337,16 +448,61 @@ def cmd_run(a):
 
 # ══ Agent 模式：不需要 API key，由 Claude Code 充當 L2 抽取層 ══
 
-def _mkchunks(hits):
-    groups = {}
-    for bk, juan, st, _, ctx in hits:
-        groups.setdefault((bk, juan, st), []).append(ctx)
+def _merge(spans):
+    """把同卷中相互重疊或緊鄰的窗口併成最大連續段，接縫因此減到最少。"""
     out = []
-    for (bk, juan, st), cs in groups.items():
-        src = "\n".join(dict.fromkeys(cs))
-        for ck in chunks(src):
-            out.append({"ci": len(out), "book": bk, "juan": juan,
-                        "stance": st, "chunk": ck})
+    for start, text in sorted(spans):
+        if out:
+            ps, pt = out[-1]
+            pend = ps + len(pt)
+            if start <= pend:                        # 重疊或緊接
+                if start + len(text) > pend:         # 向後延伸
+                    out[-1] = (ps, pt + text[pend - start:])
+                continue
+        out.append((start, text))
+    return out
+
+
+def _split(start, text, n):
+    """過長的連續段切小。chunks() 只切不改，故偏移可以累加。"""
+    out, off = [], 0
+    for piece in chunks(text, n):
+        out.append((start + off, piece))
+        off += len(piece)
+    return out
+
+
+def _mkchunks(hits, n=1400):
+    """同卷窗口併段、切塊，每塊記下各段在原卷中的絕對偏移。
+
+    一塊可能含數個不相鄰的段，接縫以 SEAM 標出；校驗時要求引文落在單一
+    段內，模型便無法靠跨縫拼接造出「原文有」的假引文。
+    """
+    groups = {}
+    for h in hits:
+        groups.setdefault((h.book, h.juan, h.stance, h.src), []).append(
+            (h.start, h.ctx))
+    out = []
+    for (bk, juan, st, srcpath), spans in groups.items():
+        pieces = []
+        for start, text in _merge(spans):
+            pieces += _split(start, text, n)
+        buf = []
+
+        def flush():
+            if not buf:
+                return
+            out.append({"ci": len(out), "book": bk, "juan": juan, "stance": st,
+                        "src": srcpath,
+                        "segments": [{"start": s, "text": t} for s, t in buf],
+                        "chunk": SEAM.join(t for _, t in buf)})
+            buf.clear()
+
+        for start, text in pieces:
+            if buf and sum(len(t) for _, t in buf) + len(text) > n:
+                flush()
+            buf.append((start, text))
+        flush()
     return out
 
 
@@ -407,14 +563,36 @@ def cmd_verify(a):
                 dropped.append({**it, "why": "ci 不存在"})
                 continue
             ev = (it.get("evidence") or "").strip()
-            if len(ev) >= 4 and ev in c["chunk"]:
-                rows.append({**it, "evidence": ev, "book": c["book"],
-                             "juan": c["juan"], "stance": c["stance"]})
-            else:
-                dropped.append({**it, "why": "引文不在原文"})
+            loc = locate(ev, c)
+            if loc is None:
+                why = ("引文跨越中略，疑為拼接"
+                       if len(ev) >= 4 and ev in c.get("chunk", "")
+                       else "引文不在原文")
+                dropped.append({**it, "why": why})
+                continue
+            rows.append({**it, "evidence": ev, "book": c["book"],
+                         "juan": c["juan"], "stance": c["stance"],
+                         "src": c.get("src"),
+                         "ev_start": loc[0], "ev_end": loc[1]})
     rows = [r for r in rows if r.get("person")]
     if not rows:
         sys.exit("無有效抽取結果")
+
+    if getattr(a, "strict", False):
+        kept, bad, skip = [], 0, 0
+        for r in rows:
+            ok = strict_check(r)
+            if ok is None:
+                skip += 1
+                kept.append(r)
+            elif ok:
+                kept.append(r)
+            else:
+                bad += 1
+                dropped.append({**r, "why": "按地址重新切片不符"})
+        rows = kept
+        print(f"--strict：重新切片核對 —— 不符 {bad} 條，無從核對 {skip} 條",
+              file=sys.stderr)
 
     seen, uniq = set(), []
     for r in rows:                       # 兩階段會重複抽到同一段
@@ -422,6 +600,24 @@ def cmd_verify(a):
         if k not in seen:
             seen.add(k)
             uniq.append(r)
+
+    # ── 人名歸一 ──
+    amap, note = {}, ""
+    af = w / "aliases.json"
+    if af.exists():
+        amap = json.load(open(af, encoding="utf-8"))
+        print(f"人名歸一：{len(amap)} 條別名，改寫 {apply_aliases(uniq, amap)} 條記載",
+              file=sys.stderr)
+    cands = [c for c in alias_candidates(uniq) if c["short"] not in amap]
+    if cands:
+        _dump(w / "aliases_suggested.json", cands)
+        lst = "；".join(f"{c['short']}→{c['suggest'] or '？'}" for c in cands[:6])
+        note = (f"人名歸一未完成：{len(cands)} 組候選待裁定（{lst}"
+                f"{'…' if len(cands) > 6 else ''}）。\n"
+                f"  未歸一時同一人的不同寫法各自成條，跨立場比對落空，"
+                f"兩邊還都會被記成「單方獨載」。\n"
+                f"  裁定：編輯 {w}/aliases_suggested.json，留下確認的對應，"
+                f'存成 {w}/aliases.json（格式 {{"善明": "劉善明"}}），再跑一次 verify。')
 
     res = analyse(uniq, sorted({r["stance"] for r in uniq}))
     _dump(w / "findings.json", res)
@@ -431,8 +627,10 @@ def cmd_verify(a):
             print(f"  ✗ {d.get('person','?')}「{(d.get('evidence') or '')[:26]}」 {d['why']}",
                   file=sys.stderr)
     with (w / "report.txt").open("w", encoding="utf-8") as fh:
-        report(res, len(dropped), fh)
-    report(res, len(dropped))
+        report(res, len(dropped), fh, note)
+    report(res, len(dropped), note=note)
+    if note:
+        print("\n⚠ " + note, file=sys.stderr)
     print(f"\n→ {w}/findings.json　{w}/report.txt", file=sys.stderr)
 
 
@@ -459,6 +657,9 @@ def main():
         q = sub.add_parser(nm)
         q.add_argument("out", help="工作目錄")
         q.add_argument("--window", type=int, default=200)
+        if nm == "verify":
+            q.add_argument("--strict", action="store_true",
+                           help="按地址從語料重新切片逐字核對（需 corpus/ 在位）")
         q.set_defaults(fn=fn)
 
     a = ap.parse_args()

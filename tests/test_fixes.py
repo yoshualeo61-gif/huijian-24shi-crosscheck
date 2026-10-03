@@ -140,12 +140,113 @@ def test_evidence_gate():
     check(bad_paraphrase not in chunk, "改寫引文被攔")
 
 
+# ── 6. 偏移錨定：跨接縫的拼接引文必須被攔下 ────────────────
+# 一個 chunk 可能由同卷中數個不相鄰的窗口拼成。舊版用子串測試
+# `ev in chunk`，橫跨接縫的引文在 chunk 裡看似連續，就這麼過了關。
+def test_offset_anchoring_rejects_splice():
+    print("6. 跨接縫拼接的引文被攔下")
+    far = "甲" * 900                          # 兩段相距遠超窗口，不會併段
+    text = ("元嘉二十七年，王玄謨進圍滑臺，魏主自率大衆來救。"
+            + far +
+            "泰始二年，王玄謨遷領軍將軍，卒於官。")
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        d = pathlib.Path("corpus") / "宋书"
+        d.mkdir(parents=True)
+        (d / "列传_卷七十六.txt").write_text(text, encoding="utf-8")
+        hits = huijian.scan(["王玄謨"], window=60)
+        cks = huijian._mkchunks(hits)
+        check(len(cks) == 1, "兩窗口落在同一 chunk", f"got {len(cks)}")
+        c = cks[0]
+        check(len(c["segments"]) == 2, "該 chunk 含兩個不相鄰的段",
+              f"got {len(c['segments'])}")
+
+        s0, s1 = c["segments"][0]["text"], c["segments"][1]["text"]
+        good = s0[:12]
+        spliced = s0[-8:] + huijian.SEAM + s1[:8]
+
+        check(huijian.locate(good, c) is not None, "段內引文通過")
+        # 舊閘門會放過它：它確實是 chunk 的子串
+        check(spliced in c["chunk"], "拼接引文確實是 chunk 的子串（舊閘門會放過）")
+        check(huijian.locate(spliced, c) is None, "新閘門攔下跨縫拼接")
+
+        # 地址必須能回原卷重新切片核對
+        a, b = huijian.locate(good, c)
+        row = {"src": c["src"], "ev_start": a, "ev_end": b, "evidence": good}
+        check(huijian.strict_check(row) is True, "按地址重新切片逐字相符",
+              f"got {huijian.strict_check(row)}")
+        bad = dict(row, evidence="王玄謨伏誅於市")
+        check(huijian.strict_check(bad) is False, "地址對不上內容時判否")
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── 7. 人名歸一：未歸一會誤報雙邊獨載 ──────────────────────
+def test_person_normalization():
+    print("7. 人名歸一候選與合併")
+    rows = [
+        {"person": "善明", "acts": ["筑城"], "time": "", "evidence": "善明築城於朐",
+         "book": "宋书", "juan": "卷八十八", "stance": "南朝系"},
+        {"person": "劉善明", "acts": ["被杀"], "time": "", "evidence": "劉善明見殺",
+         "book": "魏书", "juan": "卷六十一", "stance": "北朝系"},
+    ]
+    cands = huijian.alias_candidates(rows)
+    check(len(cands) == 1, "提出一組候選", f"got {len(cands)}")
+    check(cands[0]["short"] == "善明" and cands[0]["suggest"] == "劉善明",
+          "善明 → 劉善明", str(cands[0].get("suggest")))
+    check(cands[0]["ambiguous"] is False, "唯一候選不標 ambiguous")
+
+    # 未歸一：兩條各自成人，兩邊都被誤報「僅見於」
+    before = huijian.analyse([dict(r) for r in rows], ["南朝系", "北朝系"])
+    flags_before = [k for p in before for _, k, _ in p["flags"]]
+    check(len(before) == 2, "未歸一時算成兩個人", f"got {len(before)}")
+    check(sum("僅見於" in k for k in flags_before) == 2,
+          "未歸一時兩邊都誤報僅見於", str(flags_before))
+
+    # 歸一後：一個人，跨立場，誤報消失
+    merged = [dict(r) for r in rows]
+    n = huijian.apply_aliases(merged, {"善明": "劉善明"})
+    check(n == 1, "改寫一條記載", f"got {n}")
+    check(merged[0]["person_raw"] == "善明", "原寫法留在 person_raw")
+    after = huijian.analyse(merged, ["南朝系", "北朝系"])
+    flags_after = [k for p in after for _, k, _ in p["flags"]]
+    check(len(after) == 1, "歸一後算成一個人", f"got {len(after)}")
+    check(after[0]["stances"] == ["北朝系", "南朝系"], "跨立場成立",
+          str(after[0]["stances"]))
+    check(not any("僅見於" in k for k in flags_after),
+          "僅見於誤報消失", str(flags_after))
+
+
+# ── 8. 一短名對上多個長名時不給建議 ────────────────────────
+def test_ambiguous_alias_not_suggested():
+    print("8. 同名歧義不自作主張")
+    rows = [
+        {"person": "善明", "evidence": "x", "book": "宋书", "juan": "一",
+         "stance": "南朝系"},
+        {"person": "劉善明", "evidence": "y", "book": "魏书", "juan": "二",
+         "stance": "北朝系"},
+        {"person": "王善明", "evidence": "z", "book": "梁书", "juan": "三",
+         "stance": "南朝系"},
+    ]
+    c = [x for x in huijian.alias_candidates(rows) if x["short"] == "善明"][0]
+    check(c["ambiguous"] is True, "標為 ambiguous")
+    check(c["suggest"] is None, "不給建議值", str(c["suggest"]))
+    check(sorted(c["candidates"]) == ["劉善明", "王善明"], "兩個候選都列出",
+          str(c["candidates"]))
+
+
 if __name__ == "__main__":
     for t in (test_scan_keeps_parallel_passages,
               test_scan_still_folds_duplicates_within_a_book,
               test_era_disambiguation,
               test_no_phantom_year_anchor, test_stance_of_derivative_histories,
-              test_evidence_gate):
+              test_evidence_gate,
+              test_offset_anchoring_rejects_splice,
+              test_person_normalization,
+              test_ambiguous_alias_not_suggested):
         t()
         print()
     if FAIL:

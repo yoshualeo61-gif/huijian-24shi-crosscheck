@@ -19,7 +19,9 @@ Claude 自己就是抽取层。把下面整段贴给 Claude Code：
 4. python huijian.py expand work/
 5. 读 work/chunks2.json，同样抽取，写入 work/extracted2.json
 6. python huijian.py verify work/
-7. python duizhao.py align work/findings.json
+7. 若报告警告「人名归一未完成」，裁定 work/aliases_suggested.json
+   → 存成 work/aliases.json，重跑 verify
+8. python duizhao.py align work/findings.json
 ```
 
 **详见 [docs/07-ClaudeCode工作流.md](docs/07-ClaudeCode工作流.md)** —— 含抽取规格全文、
@@ -116,7 +118,25 @@ python3 -c "import pathlib;[print(d.name,len(list(d.iterdir()))) for d in sorted
 2. **别指望挖出新史料，指望读得快。** 优势是不知疲倦，不是更聪明。
 3. **「为什么」类的判断不要信。** 谁、何时、何地可靠；动机不可靠。
 
-## 当前状态 v0.2.1
+## 当前状态 v0.2.2
+
+v0.2.2 补了两处——不是修 bug，是把两个已知缺口做掉：
+
+**校验闸改成按地址重新切片。** 原先是子串测试 `ev in chunk`。一个 chunk
+可能由同卷中数个不相邻的窗口拼成，横跨接缝的引文在 chunk 里看似连续，
+在原书里却隔着几千字，子串测试会放它过关。现在 `scan()` 在卷的正规化全文上
+检索并记下字符偏移，块内各段带绝对地址，接缝以 `……【中略】……` 标出，
+`locate()` 要求引文完整落在单一段内。`verify --strict` 再回原卷切片逐字比对。
+副产品是每条引文都有了 `(卷, 起点, 终点)` 的机器地址，回查不必再靠人眼找。
+
+**人名归一进了 CLI，只提候选不自行合并。** 抽取规格要求 person 照原文写法、
+不补姓氏，于是《宋书》的「善明」和《魏书》的「刘善明」各自成条：跨立场比对
+落空，两边还都被误报「仅见于某系」。`verify` 现在会把候选写进
+`aliases_suggested.json` 并在报告顶部警告，确认后存成 `aliases.json` 再跑一次
+才生效，原写法保留在 `person_raw`。歧义（一个短名对上多个长名）不给建议值。
+字、号、小名覆盖不到，见文档 06。
+
+## 之前：v0.2.1
 
 **一把能用的刀，不是一篇能发的论文。**
 

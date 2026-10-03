@@ -47,7 +47,15 @@ huijian.py verify   →  report.txt         程序：逐字校验 + 矛盾判定
 6. python huijian.py verify work/
    （校验 + 分析，输出 work/report.txt 和 work/findings.json）
 
-7. python duizhao.py align work/findings.json
+7. 若第 6 步报告顶部警告「人名归一未完成」，打开 work/aliases_suggested.json，
+   逐条核对候选（同一人的不同写法才留下，ambiguous 的要自己判断），
+   把确认的对应写成 work/aliases.json，格式 {"善明": "刘善明"}，
+   然后重跑 python huijian.py verify work/
+
+8. python duizhao.py align work/findings.json
+
+想更严一点，第 6 步加 --strict：按地址回原卷重新切片逐字核对。
+语料在位时值得一跑。
 ```
 
 把 `郁洲 --also 郁州` 换成你要查的题目即可。
@@ -66,7 +74,10 @@ huijian.py verify   →  report.txt         程序：逐字校验 + 矛盾判定
    **不要"顺手"把生僻字normalize 成常见字，那会导致该条被校验丢弃。**
 3. 每条必须带 "ci" 字段，值为该 chunk 的 ci。
 4. person 用原文出现的写法（"善明"就写"善明"，不要补成"刘善明"）。
+   补姓氏是推断，不是抽取。归一在 verify 那一步做，由人确认。
 5. 无可抽者跳过该 chunk。宁可空，不可凑。
+6. **chunk 里若出现「……【中略】……」，表示它前后的文字在原书里并不相邻。**
+   evidence 绝不可跨越这个标记。跨越即拼接，校验会丢弃该条。
 
 acts 只能从此表中选（可多选，也可为空数组）：
 除授、罢黜、赴任、征战、战胜、战败、死于战、病卒、被杀、
