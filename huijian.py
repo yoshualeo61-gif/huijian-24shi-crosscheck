@@ -69,6 +69,54 @@ CAMP = {
     "元史": "元系", "明史": "明系",
 }
 
+# ── 書內陣營 ─────────────────────────────────────────────
+# 有些書本身就裝著幾個敵對政權。《三國志》的魏志、蜀志、吳志出自
+# 陳壽一人之筆，三方對同一場戰役的措辭差異是現成的好材料 —— 而按
+# 書分陣營的話，整部書只有一個「三國」，這些對照一組都抓不到。
+# 《舊五代史》同理，它按朝代分卷（後梁、後唐、後晉、後漢、後周）。
+#
+# 卷名的前綴正好記著是哪一方（檔名形如「蜀书_卷五」「后唐_卷十二」），
+# 所以不必另造資料，拿前綴去查就是。
+SUBCAMP = {
+    "三国志": {"魏书": "曹魏系", "蜀书": "蜀漢系", "吴书": "孫吳系"},
+    "旧五代史": {"后梁": "後梁系", "后唐": "後唐系", "后晋": "後晉系",
+                 "后汉": "後漢系", "后周": "後周系"},
+}
+
+# 書內陣營沒有自己的 BOOK_SPAN，須另給起訖。
+SUBCAMP_SPAN = {
+    "曹魏系": (184, 265), "蜀漢系": (214, 263), "孫吳系": (184, 280),
+    "後梁系": (907, 923), "後唐系": (923, 936), "後晉系": (936, 947),
+    "後漢系": (947, 951), "後周系": (951, 960),
+}
+
+
+def camp_of(book, juan=""):
+    """這一卷替誰說話。書內分陣營者按卷名前綴細分，其餘回書的陣營。"""
+    sub = SUBCAMP.get(book)
+    if sub and juan:
+        for pre, camp in sub.items():
+            if juan.startswith(pre):
+                return camp
+    return CAMP.get(book, "?")
+
+
+def _camp_spans():
+    """各陣營的紀事起訖：本陣營諸書的聯集，書內陣營另按 SUBCAMP_SPAN。"""
+    out = dict(SUBCAMP_SPAN)
+    for b, c in CAMP.items():
+        if b in SUBCAMP or b not in BOOK_SPAN:
+            continue                      # 書內分陣營者不併入書級陣營
+        lo, hi = BOOK_SPAN[b]
+        if c in out:
+            out[c] = (min(out[c][0], lo), max(out[c][1], hi))
+        else:
+            out[c] = (lo, hi)
+    return out
+
+
+# CAMP_SPAN 在 BOOK_SPAN 定義之後才求值（見下）。
+
 # 管線一路傳的 `stance` 指的是「替誰說話」那一條。
 # 《南史》《北史》的非獨立性現在由 DERIVED_FROM 直接表達,
 # 不再借立場標籤充當代理（v0.2.1 當初是這麼權宜的）。
@@ -89,6 +137,10 @@ BOOK_SPAN = {
     "宋史": (960, 1279), "辽史": (907, 1125), "金史": (1115, 1234),
     "元史": (1206, 1368), "明史": (1368, 1644),
 }
+
+
+# 各陣營的紀事起訖。必須等 BOOK_SPAN 就位才算得出來。
+CAMP_SPAN = _camp_spans()
 
 
 # ── 源流關係：哪部書是哪部書的刪削派生本 ──────────────────────
@@ -308,7 +360,7 @@ def scan(terms, window=200):
                 if k in seen:
                     continue
                 seen.add(k)
-                hits.append(Hit(book, juan, STANCE.get(book, "?"), t, ctx,
+                hits.append(Hit(book, juan, camp_of(book, juan), t, ctx,
                                 a, f.as_posix()))
     return hits
 
@@ -847,13 +899,11 @@ def _relevant_stances(books, all_stances):
     lo, hi = min(x[0] for x in spans), max(x[1] for x in spans)
     out = []
     for s in all_stances:
-        for b, st in STANCE.items():
-            if st != s or b not in BOOK_SPAN:
-                continue
-            blo, bhi = BOOK_SPAN[b]
-            if blo <= hi and lo <= bhi:          # 年代重疊
-                out.append(s)
-                break
+        span = CAMP_SPAN.get(s)
+        if span is None:
+            out.append(s)                 # 不認識的陣營不篩，寧可多報
+        elif span[0] <= hi and lo <= span[1]:
+            out.append(s)
     return out
 
 
@@ -1333,7 +1383,14 @@ def cmd_verify(a):
 # 「是不是通用工具」不能靠宣稱，得逐書數出來。人物層要靠列傳：
 # 某書只有本紀，它就進不了跨陣營的人物比對 —— 郁洲案例的基線在
 # 南朝系各書上無法成立，根子就在這裡（docs/06）。
+# 「志」不算：典章制度不是人物材料。把它算進來，《宋書》《南齊書》
+# 的三十一卷志會讓南朝系看起來有四十一卷可比，而傳主 harvest 實測
+# 得 0 與 2 人 —— 那是本工具最不該弄錯的方向。
 BIO_MARKS = ("列传", "列傳", "传", "傳", "世家")
+# 這兩部書通篇紀傳，門類不另標於檔名：《三國志》六十五卷全是紀與傳,
+# 《舊五代史》按朝代分卷而本紀列傳混編。這是關於這兩部書的事實陳述,
+# 不是猜 —— 所以其全部卷數都算得上人物材料。
+BIO_ALL = {"三国志", "旧五代史"}
 
 
 def juan_kinds(book):
@@ -1348,12 +1405,19 @@ def juan_kinds(book):
     return out
 
 
-def bio_juan(kinds):
-    """其中有多少卷算得上列傳。整書未分門類者無從判斷，回傳 None。"""
+def bio_juan(kinds, book=""):
+    """其中有多少卷算得上列傳。無從按檔名判斷者回傳 None，不假裝數得出來。
+
+    三類數不出來：整書作「原文版…」的；檔名無前綴的；以及書內分陣營者
+    —— 《三國志》的前綴是「魏书／蜀书／吴书」，《舊五代史》的是朝代名,
+    那是政權不是門類（而《三國志》通篇紀傳，《舊五代史》本紀列傳混編）。
+    """
     if not kinds:
         return 0
+    if book in BIO_ALL:
+        return sum(kinds.values())        # 通篇紀傳
     if all(k.startswith("原文版") or k == "未分" for k in kinds):
-        return None                      # 未分門類，數不出來
+        return None
     return sum(n for k, n in kinds.items() if any(w in k for w in BIO_MARKS))
 
 
@@ -1367,8 +1431,14 @@ def coverage():
         rows.append({
             "book": book,
             "juan": sum(kinds.values()),
-            "bio": bio_juan(kinds),
+            "bio": bio_juan(kinds, book),
             "camp": CAMP.get(book, "?"),
+            "subcamps": sorted({camp_of(book, k) for k in kinds}
+                               & set(SUBCAMP_SPAN)),
+            # 卷按前綴分攤到各陣營：《三國志》魏志 30、吳志 20、蜀志 15
+            "per_camp": {c: sum(n for k, n in kinds.items()
+                                if camp_of(book, k) == c)
+                         for c in {camp_of(book, k) for k in kinds}},
             "compiler": COMPILER.get(book, "?"),
             "span": (lo, hi),
             "eras": sum(1 for _, y, _ in duizhao.ERAS if lo <= y <= hi),
@@ -1398,6 +1468,8 @@ def cmd_cover(a):
         bio = "未分" if r["bio"] is None else str(r["bio"])
         lo, hi = r["span"]
         src = f"（刪削自《{'》《'.join(r['derived'])}》）" if r["derived"] else ""
+        if r["subcamps"]:
+            src += f"（書內分：{'、'.join(r['subcamps'])}）"
         print(f"{r['book']:8s}{r['juan']:>5d}{bio:>5s}{r['eras']:>5d}  "
               f"{r['camp']:6s}{r['compiler']:6s}{lo:>6d}–{hi:<5d} "
               f"{'、'.join(r['rivals']) or '—'}{src}")
@@ -1408,18 +1480,37 @@ def cmd_cover(a):
     # 逐**陣營**判一次，不是逐書：同一陣營裡《魏書》有 92 卷列傳而
     # 《北齊書》一卷都數不出來，逐書判會把北朝系同時列進「做得動」
     # 和「太薄」兩欄。
-    bycamp, rivals = collections.defaultdict(list), collections.defaultdict(set)
+    # 按卷名前綴分攤：《三國志》的六十五卷要算進曹魏、蜀漢、孫吳三個
+    # 陣營，不是算進一個「三國」。否則書內對立這一層根本顯示不出來。
+    bio, camp_books = collections.Counter(), collections.defaultdict(set)
     for r in rows:
-        if r["juan"]:
-            bycamp[r["camp"]].append(r)
-            rivals[r["camp"]] |= set(r["rivals"])
-    bio = {c: sum(x["bio"] or 0 for x in v) for c, v in bycamp.items()}
+        if not r["juan"]:
+            continue
+        whole = r["bio"] if r["bio"] is not None else 0
+        share = whole / r["juan"] if r["juan"] else 0
+        for c, n in r["per_camp"].items():
+            bio[c] += round(n * share)
+            camp_books[c].add(r["book"])
+    # 對手：斷代重疊、陣營不同，且兩邊不是同一條源流（《新五代史》
+    # 刪削《舊五代史》，兩者不算互相獨立的對手）。
+    rivals = collections.defaultdict(set)
+    for c1 in camp_books:
+        for c2 in camp_books:
+            if c1 == c2:
+                continue
+            s1, s2 = CAMP_SPAN.get(c1), CAMP_SPAN.get(c2)
+            if not s1 or not s2 or s1[0] > s2[1] or s2[0] > s1[1]:
+                continue
+            if all(derivation(b1, b2)
+                   for b1 in camp_books[c1] for b2 in camp_books[c2]):
+                continue
+            rivals[c1].add(c2)
     ok, weak = [], []
-    for c, v in bycamp.items():
+    for c in camp_books:
         if not rivals[c]:
             continue
-        best = max((bio.get(o, 0) for o in rivals[c]), default=0)
         who = max(rivals[c], key=lambda o: bio.get(o, 0))
+        best = bio.get(who, 0)
         (ok if bio[c] >= 20 and best >= 20 else weak).append(
             (c, bio[c], who, best))
     for c, m, who, o in sorted(ok, key=lambda x: -min(x[1], x[3])):

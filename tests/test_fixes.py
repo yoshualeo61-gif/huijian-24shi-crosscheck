@@ -906,10 +906,11 @@ def test_single_witness_is_not_a_signal():
 def test_offperiod_books_excluded():
     print("15k. 斷代不重疊的書，其沉默不算無載")
     # 《三國志》（184–280）不記張稷（卒 513）不是諱飾，它記的是三國。
+    # 用陣營（CAMP），不是編纂（COMPILER）—— 兩條軸自 v0.2.6 分開。
     rel = huijian._relevant_stances({"梁书", "魏书"},
-                                    ["南朝系", "北朝系", "晋修", "清修"])
-    check("晋修" not in rel, "《三國志》所屬立場被排除", str(rel))
-    check("清修" not in rel, "《明史》所屬立場被排除", str(rel))
+                                    ["南朝系", "北朝系", "曹魏系", "明系"])
+    check("曹魏系" not in rel, "《三國志》魏志（184–265）被排除", str(rel))
+    check("明系" not in rel, "《明史》（1368–1644）被排除", str(rel))
     check("南朝系" in rel and "北朝系" in rel, "斷代重疊的留下", str(rel))
     # 語料裡沒有 BOOK_SPAN 的書時，不做篩選，寧可多報不可漏報
     check(huijian._relevant_stances({"無此書"}, ["甲", "乙"]) == ["甲", "乙"],
@@ -1068,6 +1069,138 @@ def test_coverage_report():
           f"《宋史》斷代內有 {rows['宋史']['eras']} 個年號可換算")
 
 
+# ── 17. 書內陣營：一部書裡裝著幾個敵對政權 ──────────────────
+def test_camp_of_subbook():
+    print("17. 《三國志》《舊五代史》按卷名前綴分陣營")
+    check(huijian.camp_of("三国志", "魏书_卷一") == "曹魏系", "魏志 → 曹魏系")
+    check(huijian.camp_of("三国志", "蜀书_卷五") == "蜀漢系", "蜀志 → 蜀漢系")
+    check(huijian.camp_of("三国志", "吴书_卷二") == "孫吳系", "吳志 → 孫吳系")
+    check(huijian.camp_of("旧五代史", "后唐_卷十二") == "後唐系",
+          "舊五代史按朝代分")
+    # 不分陣營的書照回書的陣營；沒有卷名時也不出錯
+    check(huijian.camp_of("宋史", "本纪_卷七") == "宋系", "《宋史》仍是宋系")
+    check(huijian.camp_of("三国志") == "三國", "無卷名時回書級陣營")
+    check(huijian.camp_of("無此書", "卷一") == "?", "不認識的書回 ?")
+
+
+def test_camp_span_includes_subcamps():
+    print("17b. 書內陣營要有自己的起訖")
+    check(huijian.CAMP_SPAN["蜀漢系"] == (214, 263), "蜀漢系 214–263",
+          str(huijian.CAMP_SPAN.get("蜀漢系")))
+    check(huijian.CAMP_SPAN["後梁系"] == (907, 923), "後梁系 907–923")
+    # 書級陣營仍為本陣營諸書的聯集
+    check(huijian.CAMP_SPAN["南朝系"] == (420, 589), "南朝系取諸書聯集",
+          str(huijian.CAMP_SPAN.get("南朝系")))
+    # 書內分陣營者不併入書級陣營，否則「三國」會蓋掉三個細陣營
+    check("三國" not in huijian.CAMP_SPAN or
+          huijian.CAMP_SPAN.get("三國") is None,
+          "《三國志》不另算一個「三國」陣營的起訖",
+          str(huijian.CAMP_SPAN.get("三國")))
+    # _relevant_stances 認得書內陣營
+    rel = huijian._relevant_stances({"三国志"},
+                                    ["曹魏系", "孫吳系", "明系"])
+    check("明系" not in rel, "《明史》斷代不重疊，排除", str(rel))
+    check("曹魏系" in rel and "孫吳系" in rel, "三國各陣營留下", str(rel))
+
+
+def test_same_book_rival_sections():
+    print("17c. 魏志對吳志：同書異志，一人之筆")
+    # 赤壁之戰。《魏志》諱敗（「不利」「大疫」「引軍還」），
+    # 《吳志》直書「大破之，焚其舟船」—— 同一部書，陳壽一人之筆。
+    a = {"person": "曹操", "place": "赤壁", "time": "建安十三年",
+         "acts": ["战败"],
+         "evidence": "公至赤壁，與備戰，不利。於是大疫，吏士多死者，乃引軍還",
+         "book": "三国志", "juan": "魏书_卷一",
+         "stance": huijian.camp_of("三国志", "魏书_卷一")}
+    b = {"person": "曹操", "place": "赤壁", "time": "建安十三年",
+         "acts": ["战败"], "evidence": "與曹公戰於赤壁，大破之，焚其舟船",
+         "book": "三国志", "juan": "吴书_卷二",
+         "stance": huijian.camp_of("三国志", "吴书_卷二")}
+    g = duizhao.align([a, b])
+    check(len(g) == 1, "並置得到（舊版整部書只有一個陣營，一組都抓不到）",
+          str(len(g)))
+    p = g[0]
+    check(any("同年 208" in w for w in p["anchors"]),
+          "建安十三年 → 208，同年錨定成立", str(p["anchors"]))
+    ks = [k for _, k, _ in p["diverge"]]
+    check(any("同書異志" in k for k in ks),
+          "標為同書異志，而非「同修」", str(ks))
+    why = [t for _, k, t in p["diverge"] if "同書異志" in k][0]
+    check("一人取捨" in why, "說明所異出於一人之筆", why)
+
+
+def test_eras_184_to_420():
+    print("17d. 184–420 的年號")
+    cases = [("建安十三年", "三国志", 208), ("章武元年", "三国志", 221),
+             ("黄龙二年", "三国志", 230), ("青龙三年", "三国志", 235),
+             ("太康元年", "晋书", 280), ("永嘉五年", "晋书", 311),
+             ("义熙九年", "晋书", 413), ("中平元年", "后汉书", 184)]
+    for t, b, exp in cases:
+        r = duizhao.to_year(t, b)
+        check(r is not None and r[0] == exp, f"{t}（{b}）→ {exp}", str(r))
+
+
+def test_three_kingdoms_era_collisions():
+    print("17e. 三國兩晉同名年號極多：書名消不了的，陣營消得了")
+    # 「建興」蜀漢 223、孫吳 252、西晉 313 —— 三個。只收一個會把另外
+    # 兩朝的紀年悄悄換算成差幾十年的公元數，還在 pair_score 裡加 3 分。
+    cands = {y for y, e, _ in duizhao.era_candidates("建興元年") if e == "建興"}
+    check({223, 252, 313} <= cands, "三個元年都收了", str(sorted(cands)))
+    check(duizhao.to_year("建興元年") is None, "無書名可據時不猜")
+    # 《晉書》起訖 220–420，三個建興全在區間內 —— 書名幫不上忙
+    check(duizhao.to_year("建興元年", "晋书") is None,
+          "《晉書》容得下三個建興，僅憑書名不猜",
+          str(duizhao.to_year("建興元年", "晋书")))
+    check(duizhao.to_year("建興元年", "晋书", "晉系")[0] == 313,
+          "加上陣營「晉系」→ 西晉 313")
+    # 「甘露」曹魏 256、孫吳 265，同在《三國志》之內 —— 而魏志吳志
+    # 分得開，這正是書內陣營帶來的新能力。
+    check(duizhao.to_year("甘露元年", "三国志") is None,
+          "整部《三國志》容得下兩個甘露，不猜")
+    check(duizhao.to_year("甘露元年", "三国志", "曹魏系")[0] == 256,
+          "魏志 → 曹魏 256")
+    check(duizhao.to_year("甘露元年", "三国志", "孫吳系")[0] == 265,
+          "吳志 → 孫吳 265")
+    check(duizhao.to_year("建兴元年", "三国志", "蜀漢系")[0] == 223,
+          "蜀志 → 蜀漢 223")
+    # parse_date 會把 row 的 stance 傳下去
+    d = duizhao.parse_date({"time": "甘露元年", "book": "三国志",
+                            "stance": "孫吳系", "evidence": ""})
+    check(d["year"] and d["year"][0] == 265,
+          "parse_date 用得到陣營", str(d["year"]))
+    # 既有行為不得退步
+    check(duizhao.to_year("延昌二年", "魏书")[0] == 513, "延昌二年 → 513")
+
+
+def test_bio_juan_rules():
+    print("17f. 列傳卷數：志不算，通篇紀傳者全算")
+    # 「志」是典章制度，不是人物材料。算進來的話，《宋書》《南齊書》
+    # 的三十一卷志會讓南朝系看起來有四十一卷可比，而傳主 harvest
+    # 實測得 0 與 2 人 —— 那是本工具最不該弄錯的方向。
+    check(huijian.bio_juan({"志": 30, "本纪": 10}, "宋书") == 0,
+          "《宋書》只有志與本紀 → 0 卷列傳",
+          str(huijian.bio_juan({"志": 30, "本纪": 10}, "宋书")))
+    check(huijian.bio_juan({"列传": 255, "志": 162, "本纪": 47}, "宋史") == 255,
+          "《宋史》255 卷列傳，志不計")
+    # 通篇紀傳而門類不標於檔名者，全部算上
+    check(huijian.bio_juan({"魏书": 30, "蜀书": 15, "吴书": 20},
+                           "三国志") == 65,
+          "《三國志》六十五卷全是紀傳")
+    check(huijian.bio_juan({"原文版梁书": 12}, "梁书") is None,
+          "整書作「原文版…」者回 None，不假裝數得出來")
+    check(huijian.bio_juan({}, "無此書") == 0, "語料裡沒有的書 → 0")
+
+
+def test_era_usage_single_mention_is_unjudgeable():
+    print("17g. 一個年次只出現一次，判斷不了就說判斷不了")
+    # 《宋史》引一紙文書的款識作「元興六年」，而東晉元興只有三年。
+    # 靠那一處去推「義熙」的元年，報出來的是假警報。
+    text = {"宋史": "其末題云：元興六年。"}
+    mx, books = duizhao.era_usage(text, "元興")
+    check(mx is None, "孤例 → None，不拿來充數", str(mx))
+    check(books and books["宋史"] == 1, "但出現處照實回報", str(books))
+
+
 if __name__ == "__main__":
     for t in (test_scan_keeps_parallel_passages,
               test_scan_still_folds_duplicates_within_a_book,
@@ -1117,7 +1250,14 @@ if __name__ == "__main__":
               test_era_usage_substring_guard,
               test_era_usage_ignores_lone_outlier,
               test_suicide_is_an_act,
-              test_coverage_report):
+              test_coverage_report,
+              test_camp_of_subbook,
+              test_camp_span_includes_subcamps,
+              test_same_book_rival_sections,
+              test_eras_184_to_420,
+              test_three_kingdoms_era_collisions,
+              test_bio_juan_rules,
+              test_era_usage_single_mention_is_unjudgeable):
         t()
         print()
     if FAIL:
