@@ -6,7 +6,7 @@
     python tests/test_fixes.py
 """
 
-import collections, json, os, pathlib, shutil, sys, tempfile
+import collections, json, os, pathlib, re, shutil, sys, tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import huijian, duizhao, biaozhu
@@ -330,25 +330,26 @@ def test_baseline_downweights_silence():
 
 def test_terminal_rate_counts():
     print("11b. 終局著錄率統計")
+    # 名字必須兩字以上（單字名無分辨力，已在 terminal_rate 裡篩掉），
+    # 且終局用語要與人名同句才算 —— 兩條都是真語料上吃過教訓才加的。
     tmp = tempfile.mkdtemp()
     cwd = os.getcwd()
     try:
         os.chdir(tmp)
         (pathlib.Path("corpus") / "魏书").mkdir(parents=True)
         (pathlib.Path("corpus") / "宋书").mkdir(parents=True)
-        # 兩人之間填足距離，否則 window 會把兩人的上下文疊在一起
         pathlib.Path("corpus/魏书/一.txt").write_text(
-            "甲戍郁洲，後見殺。" + "紀事" * 150 + "乙鎮壽陽，有功，久之去職。",
+            "张稷戍郁洲，後見殺。垣崇祖鎮壽陽，有功，久之去職。",
             encoding="utf-8")
         pathlib.Path("corpus/宋书/一.txt").write_text(
-            "甲之任，乙築城。", encoding="utf-8")
-        base = huijian.terminal_rate(["甲", "乙"], window=120)
+            "张稷之任，垣崇祖築城。", encoding="utf-8")
+        base = huijian.terminal_rate(["张稷", "垣崇祖"])
 
-        # 中間夾著別人時，不得把鄰人的死算到自己頭上
+        # 同句裡還有別人時，歸屬不明，不算
         (pathlib.Path("corpus") / "北齐书").mkdir(parents=True)
         pathlib.Path("corpus/北齐书/一.txt").write_text(
-            "丙與乙俱出，乙見殺。", encoding="utf-8")
-        near = huijian.terminal_rate(["丙", "乙"], window=60)
+            "张稷與垣崇祖俱出，垣崇祖見殺。", encoding="utf-8")
+        near = huijian.terminal_rate(["张稷", "垣崇祖"])
     finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -357,8 +358,26 @@ def test_terminal_rate_counts():
     check(abs(base["魏书"]["rate"] - 0.5) < 1e-9, "著錄率 50%",
           str(base["魏书"]["rate"]))
     check(base["宋书"]["k"] == 0, "宋书：無終局用語", str(base["宋书"]))
-    check(near["北齐书"]["k"] == 1, "夾著別人時只算得一人",
+    check(base["魏书"]["usable"] is False,
+          f"n=2 遠低於 {huijian.BASELINE_MIN_N}，標為不可用")
+    check(near["北齐书"]["k"] == 1, "同句夾著別人時只算得一人",
           str(near["北齐书"]))
+
+
+def test_terminal_rate_filters_short_names():
+    print("11c. 單字名不得進入基線群體")
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        (pathlib.Path("corpus") / "魏书").mkdir(parents=True)
+        pathlib.Path("corpus/魏书/一.txt").write_text(
+            "恩走郁洲，帝追破之，王亮卒。", encoding="utf-8")
+        base = huijian.terminal_rate(["恩", "帝"])
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+    check(base == {}, "全是單字名時群體為空，不產出假比率", str(base))
 
 
 # ── 12. 置換檢驗：類別名必須剝掉立場，否則分布會碎掉 ────────
@@ -517,6 +536,146 @@ def test_sample_judges_extracted_name():
           a["person_normalized"])
 
 
+# ── 14. 真語料上發現的問題（全部可離線復現）──────────────────
+def test_vernacular_truncation():
+    print("14. 現代白話不得混進語料")
+    # 上游有些頁面在原文之後直接接白話譯文，只用一行「译文（…）」作界,
+    # 而檔名仍叫「原文」。混進來最險的地方是：逐字校驗**攔不住**它 ——
+    # 譯文確實逐字存在於 chunk 裡，引文會「通過」校驗。
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    try:
+        p = tmp / "a.html"
+        p.write_text(
+            "<h1>卷一 原文</h1><p>段译</p><p>译文</p>"
+            # 原文須有相當長度：html_to_text 要求已累積 200 字才認界線,
+            # 免得頁首的任何東西把整卷切光（真實的卷都是數千字）。
+            + "<p>宣秉字巨公，冯翊云阳人也。少修高节，显名三辅。" * 12 + "</p>"
+            "<p>上一篇目录下一篇</p>"
+            "<p>译文（宣秉）</p>"
+            "<p>宣秉字巨公，是冯翊云阳人。他年轻时就修养高尚的节操。</p>",
+            encoding="utf-8")
+        t = huijian.html_to_text(p)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    check("宣秉字巨公，冯翊云阳人也" in t, "原文保留")
+    check("他年轻时" not in t, "「译文（…）」之後的白話被截掉")
+    check("上一篇目录下一篇" not in t, "導覽文字被濾掉")
+    # 孤立一行「译文」是頁首導覽標籤（《史記》各頁作「段译 / 译文」),
+    # 出現在原文之前。當成界線會把整卷原文切光 —— 初版就是這麼錯的,
+    # 三國志、史記、漢書 三部書當場歸零。
+    check("宣秉字巨公" in t, "孤立的「译文」標籤不得當作界線")
+
+
+def test_vernacular_density_gate():
+    print("14b. 通篇白話而無界線的卷，靠內容判掉")
+    wen = "宣秉字巨公，冯翊云阳人也。少修高节，显名三辅。建武元年，拜御史中丞。"
+    bai = "宣秉是冯翊云阳人，他的节操很高尚，所以在三辅一带很有名的。"
+    check(huijian.vernacular_density(wen) < huijian.VERNACULAR_MAX,
+          f"文言密度 {huijian.vernacular_density(wen):.2f} 低於門檻")
+    check(huijian.vernacular_density(bai * 20) > huijian.VERNACULAR_MAX,
+          f"白話密度 {huijian.vernacular_density(bai*20):.2f} 高於門檻")
+
+
+def test_expand_name_guard():
+    print("14c. 階段二的人名必須先篩")
+    # 抽取規格刻意不補姓氏，於是必然出現單字名；而「帝」在真語料裡
+    # 出現 59,084 次，拿它當人名掃全庫只會灌出幾千個無意義 chunk。
+    keep, drop = huijian._usable_names(["帝", "恩", "张稷", "徐玄明", "高祖"])
+    dropped = {n for n, _ in drop}
+    check("帝" in dropped and "恩" in dropped, "單字名被篩掉", str(dropped))
+    check("高祖" in dropped, "帝號泛稱被篩掉", str(dropped))
+    check(sorted(keep) == ["张稷", "徐玄明"], "多字人名保留", str(keep))
+    check(all(why for _, why in drop), "每個被篩掉的都給了理由")
+
+
+def test_terminal_attribution_same_clause():
+    print("14d. 終局用語須與人名同句")
+    # 初版取前後 120 字窗口，而「卒」在列傳裡俯拾即是，於是任何在列傳
+    # 出現過的名字都算「記其終」—— 實測三國志、史記、後漢書全報 100%。
+    s = "张稷字公乔，吴郡人也。历官至镇北将军。王亮卒。"
+    m = re.search("张稷", s)
+    check(huijian._attributable(s, "张稷", m, 25) is False,
+          "別人的「卒」在別句，不算本人的")
+    s2 = "徐玄明斩送张稷首，张稷见杀。"
+    m2 = [x for x in re.finditer("张稷", s2)][1]
+    check(huijian._attributable(s2, "张稷", m2, 25) is True,
+          "同句緊接的終局用語算本人的")
+
+
+def test_baseline_min_n_gate():
+    print("14e. 樣本不足的基線不得調權重")
+    rows = [
+        {"person": "甲", "acts": ["被杀"], "time": "", "evidence": "甲見殺",
+         "book": "魏书", "juan": "一", "stance": "北朝系"},
+        {"person": "甲", "acts": ["赴任"], "time": "", "evidence": "甲之任",
+         "book": "梁书", "juan": "二", "stance": "南朝系"},
+    ]
+    # 0/3 與 0/300 數字上都是 0%，證據力差兩個數量級
+    tiny = {"梁书": {"n": 3, "k": 0, "rate": 0.0}}
+    r = huijian.analyse([dict(x) for x in rows], ["南朝系", "北朝系"], tiny)
+    f = [(w, y) for p in r for w, k, y in p["flags"] if "終局獨載" in k]
+    check(f and f[0][0] == 5, f"n=3 時不調權重，維持 5", str(f[0][0] if f else None))
+    check(f and "無基線可比" in f[0][1], "並明說無基線可比")
+    big = {"梁书": {"n": 300, "k": 6, "rate": 0.02}}
+    r2 = huijian.analyse([dict(x) for x in rows], ["南朝系", "北朝系"], big)
+    f2 = [w for p in r2 for w, k, _ in p["flags"] if "終局獨載" in k]
+    check(f2 and f2[0] == 2, "n=300 且比率低 → 降權為 2", str(f2))
+
+
+def test_era_divergence_only_for_once_only_acts():
+    print("14f. 紀年歧異只對一次性行為成立")
+    # 張稷在《梁書》本紀五度除授，舊規則把四個不同的任命當成
+    # 「同一事繫於不同時間」，報了一條假歧異。
+    appointments = [
+        {"person": "张稷", "acts": ["除授"], "time": t, "evidence": f"除授{t}",
+         "book": "梁书", "juan": "二", "stance": "南朝系"}
+        for t in ("十二月丙申", "十一月辛未", "冬十月丙寅", "癸卯")
+    ]
+    r = huijian.analyse(appointments, ["南朝系"])
+    ks = [k for p in r for _, k, _ in p["flags"]]
+    check(not any("紀年歧異" in k for k in ks),
+          "反覆除授不報紀年歧異", str(ks))
+    deaths = [
+        {"person": "某", "acts": ["被杀"], "time": "延昌二年",
+         "evidence": "見殺", "book": "魏书", "juan": "一", "stance": "北朝系"},
+        {"person": "某", "acts": ["被杀"], "time": "延昌三年",
+         "evidence": "被誅", "book": "北齐书", "juan": "二", "stance": "北朝系"},
+    ]
+    ks2 = [k for p in huijian.analyse(deaths, ["北朝系"]) for _, k, _ in p["flags"]]
+    check(any("紀年歧異" in k for k in ks2), "終局繫於兩年則報歧異", str(ks2))
+
+
+def test_compatible_time_strings():
+    print("14g. 窗口截掉年號造成的「歧異」不算歧異")
+    # 《魏書》帝紀作「二年二月」，列傳作「延昌二年二月」—— 同一天,
+    # 差別只是檢索窗口把年號截在外面。
+    check(huijian._distinct_times({"二年二月", "延昌二年二月"}) == ["延昌二年二月"],
+          "後綴相容者收成一條")
+    check(len(huijian._distinct_times({"延昌二年", "太和三年"})) == 2,
+          "真正不同的紀年仍分開")
+
+
+def test_far_years_disqualify_pairing():
+    print("14h. 年代相去太遠不得配成一組")
+    # 徐玄明殺張稷（513）曾與郁洲獻白鹿（475）配成一組，只因同地同月。
+    a = {"person": "徐玄明", "place": "郁洲", "time": "延昌二年二月",
+         "acts": ["归降"], "evidence": "以州内附", "book": "魏书",
+         "juan": "一", "stance": "北朝系"}
+    b = {"person": "刘善明", "place": "郁洲", "time": "元徽三年二月甲子",
+         "acts": [], "evidence": "白鹿见郁洲", "book": "宋书",
+         "juan": "二", "stance": "南朝系"}
+    aa, ab = duizhao.anchors(a), duizhao.anchors(b)
+    check(aa["year"][0] == 513 and ab["year"][0] == 475, "兩年分別為 513／475",
+          f"{aa['year']} {ab['year']}")
+    sc, why = duizhao.pair_score(aa, ab)
+    check(sc == 0 and not why, f"相隔 38 年 → 判為兩件事（得 {sc} 分）", str(why))
+    check(duizhao.align([a, b]) == [], "不產出對照組")
+    # 相差一年仍允許並置，那是考異的常見形態
+    c = dict(b, time="延昌三年二月")
+    sc2, _ = duizhao.pair_score(aa, duizhao.anchors(c))
+    check(sc2 > 0, "相差一年仍可並置", str(sc2))
+
+
 if __name__ == "__main__":
     for t in (test_scan_keeps_parallel_passages,
               test_scan_still_folds_duplicates_within_a_book,
@@ -530,6 +689,7 @@ if __name__ == "__main__":
               test_day_divergence_and_era_boundary,
               test_baseline_downweights_silence,
               test_terminal_rate_counts,
+              test_terminal_rate_filters_short_names,
               test_flag_kind_strips_stance,
               test_permutation_is_sensitive,
               test_wilson_interval,
@@ -537,7 +697,15 @@ if __name__ == "__main__":
               test_stratified_sampling,
               test_annotation_values_are_validated,
               test_rate_excludes_na,
-              test_sample_judges_extracted_name):
+              test_sample_judges_extracted_name,
+              test_vernacular_truncation,
+              test_vernacular_density_gate,
+              test_expand_name_guard,
+              test_terminal_attribution_same_clause,
+              test_baseline_min_n_gate,
+              test_era_divergence_only_for_once_only_acts,
+              test_compatible_time_strings,
+              test_far_years_disqualify_pairing):
         t()
         print()
     if FAIL:

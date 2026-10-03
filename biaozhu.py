@@ -271,7 +271,13 @@ def cmd_sample(a):
     items = build_sample(w, a.n, a.flags, a.rejects, a.seed, huijian.TERMINAL)
     out = w / a.name
     out.parent.mkdir(parents=True, exist_ok=True)
-    json.dump(items, open(out, "w", encoding="utf-8"),
+    # 把允許值與指南一併寫進檔案：標注界面照這份資料畫按鈕、顯示說明，
+    # 就不必在 JS 裡再抄一份 —— 抄一份就會各自漂移，而漂移是查不出來的。
+    doc = {"meta": {"values": VALUES, "guide": GUIDE,
+                    "seed": a.seed, "counts": dict(collections.Counter(
+                        i["track"] for i in items))},
+           "items": items}
+    json.dump(doc, open(out, "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     ws = out.with_suffix(".txt")
     with ws.open("w", encoding="utf-8") as fh:
@@ -289,6 +295,13 @@ def cmd_sample(a):
 
 
 # ── 計分 ──────────────────────────────────────────────────
+def _items(doc):
+    """標注檔可以是 {"meta":…, "items":[…]} 或裸陣列（手寫的舊檔）。"""
+    if isinstance(doc, dict):
+        return doc.get("items") or []
+    return doc
+
+
 def _check(items):
     bad = []
     for it in items:
@@ -326,7 +339,7 @@ def cmd_score(a):
     p = w / a.name
     if not p.exists():
         sys.exit(f"找不到 {p}")
-    items = json.load(open(p, encoding="utf-8"))
+    items = _items(json.load(open(p, encoding="utf-8")))
     bad = _check(items)
     if bad:
         print("標注檔有問題，先修掉再計分：", file=sys.stderr)
@@ -390,7 +403,8 @@ def cmd_score(a):
         q = pathlib.Path(a.second)
         if not q.exists():
             q = w / a.second
-        other = {it["id"]: it for it in json.load(open(q, encoding="utf-8"))}
+        other = {it["id"]: it
+                 for it in _items(json.load(open(q, encoding="utf-8")))}
         print(f"\n{'='*66}\n標注者一致性（Cohen's κ）　乙＝{q}\n{'='*66}")
         for tr, field in (("A", "overall"), ("B", "reading"),
                           ("B", "interpretation"), ("C", "rejection")):

@@ -46,7 +46,13 @@ ACTS = ["除授", "罢黜", "赴任", "征战", "战胜", "战败", "死于战",
         "被杀", "归降", "被俘", "叛乱", "筑城", "赈济", "上书", "出使",
         "逃亡", "受封赏"]
 TERMINAL = {"死于战", "病卒", "被杀", "归降", "被俘"}   # 任兩者並存＝硬矛盾
-PAIRS = [("战胜", "战败"), ("除授", "罢黜")]
+PAIRS = [("战胜", "战败")]
+
+# 故意留的錯誤規則。一個人先任後免是正常序列，這條必然誤報。
+# 留著是為了讓人第一次跑就明白規則需要校準 —— 但**預設不啟用**：
+# 預設就誤報的工具沒法用，而且公開倉庫裡沒人知道哪條是故意的。
+# 要親眼看它誤報：verify / run 加 --demo-bad-rule。
+DEMO_BAD_PAIRS = [("除授", "罢黜")]
 
 # 終局用語：供基線統計用的保守詞表。只收歧義小的，寧漏不濫 ——
 # 基線本身若充滿誤判，拿它校準別的判斷就毫無意義。
@@ -70,14 +76,48 @@ Hit = collections.namedtuple("Hit", "book juan stance term ctx start src")
 
 
 # ── 語料 ──────────────────────────────────────────────────
+# 現代白話的判別：文言幾乎不用結構助詞「的」。實測全語料 2,413 卷,
+# 「的」密度中位數 0.00／千字、p99 只有 0.59，而上游那一卷通篇白話的
+# 檔案是 16.00 —— 差兩個數量級，門檻放在 2.0 仍留三倍餘裕。
+VERNACULAR_MAX = 2.0
+
+# 譯文段落的界線寫作「译文（人名、人名…）」或「译文：」。
+# **不可**把孤零零一行「译文」也當界線 —— 那是頁首的導覽標籤
+# （《史記》各頁作「段译 / 译文」兩個連結），出現在原文之前；
+# 當成界線會把整卷原文切掉。初版就是這麼錯的，三國志、史記、
+# 漢書 三部書當場歸零。
+VERNACULAR_RE = re.compile(r"^(译文|譯文)\s*[（(：:]")
+NAV_TABS = ("译文", "譯文", "段译", "段譯")
+
+
+def vernacular_density(t):
+    """每千字的「的」字數。粗，但在這份語料上區分力極強。"""
+    return t.count("的") / len(t) * 1000 if t else 0.0
+
+
 def html_to_text(p):
     s = p.read_text(encoding="utf-8", errors="ignore")
     s = re.sub(r"<script.*?</script>|<style.*?</style>", "", s, flags=re.S)
     s = re.sub(r"<[^>]+>", "\n", s)
     s = html.unescape(s)
-    junk = ("←", "首页", "目录", "下一节", "上一节", "原文", "返回", "阿星星")
-    keep = [l.strip() for l in s.split("\n")]
-    return "\n".join(l for l in keep if l and not any(l.startswith(j) for j in junk))
+    junk = ("←", "首页", "目录", "下一节", "上一节", "原文", "返回", "阿星星",
+            "上一篇目录下一篇")
+    out = []
+    for l in (x.strip() for x in s.split("\n")):
+        if not l or any(l.startswith(j) for j in junk):
+            continue
+        # 上游有些頁面在原文之後直接接上現代白話譯文，中間只有一行
+        # 「译文（……）」作界，而檔名仍叫「原文」—— 靠檔名排除不掉。
+        # 這一段若混進語料，抽取會把譯者的話當成史源，而逐字校驗
+        # **攔不住它**：譯文確實逐字存在於 chunk 裡。
+        if l in NAV_TABS:
+            continue                       # 導覽標籤，跳過這一行即可
+        # 只有累積了足夠原文之後才認界線，免得頁首的任何東西
+        # 把整卷切光 —— 寧可多留一段譯文，不可丟掉一整卷原文。
+        if VERNACULAR_RE.match(l) and sum(len(x) for x in out) >= 200:
+            break
+        out.append(l)
+    return "\n".join(out)
 
 
 def cmd_fetch(_):
@@ -85,7 +125,7 @@ def cmd_fetch(_):
         print("clone …", file=sys.stderr)
         subprocess.run(["git", "clone", "--depth", "1", "-q", REPO], check=True)
     COR.mkdir(exist_ok=True)
-    stats = []
+    stats, skipped = [], []
     for book in sorted(RAW.iterdir()):
         if not book.is_dir() or book.name.endswith("-白话"):
             continue
@@ -101,6 +141,13 @@ def cmd_fetch(_):
             t = html_to_text(f)
             if len(t) < 200:
                 continue
+            # 另有整卷誤標的：檔名作「原文」，內容卻通篇白話，且沒有
+            # 「译文」界線可依（實測上游 晋书／帝纪／第十章 即是）。
+            # 這類只能靠內容判，判掉就報出來，不靜默丟棄。
+            vd = vernacular_density(t)      # d 已是輸出目錄，勿覆蓋
+            if vd > VERNACULAR_MAX:
+                skipped.append((book.name, f.name, vd))
+                continue
             name = re.sub(r"[^\w\u4e00-\u9fff-]", "", f.parent.name + "_" + f.stem)
             (d / f"{name}.txt").write_text(t, encoding="utf-8")
             n += 1
@@ -111,6 +158,11 @@ def cmd_fetch(_):
     for b, s, n, c in stats:
         print(f"{b:8s} {s:8s} {n:5d} {c:11,d}")
     print(f"{'合計':8s} {'':8s} {sum(x[2] for x in stats):5d} {sum(x[3] for x in stats):11,d}")
+    if skipped:
+        print(f"\n排除 {len(skipped)} 卷：內容為現代白話，檔名卻標作原文",
+              file=sys.stderr)
+        for bk, fn, d in skipped:
+            print(f"  ✗ {bk}／{fn}　「的」密度 {d:.2f}／千字", file=sys.stderr)
 
 
 # ── 變體擴展 ───────────────────────────────────────────────
@@ -274,32 +326,108 @@ def extract(hits, key, limit=0, dry=False, debug=False):
     return rows, dropped
 
 
+def _pairs(demo):
+    if not demo:
+        return list(PAIRS)
+    print("--demo-bad-rule：已啟用故意的錯誤規則 "
+          f"{DEMO_BAD_PAIRS}，它會誤報，這是示範用的。", file=sys.stderr)
+    return list(PAIRS) + list(DEMO_BAD_PAIRS)
+
+
 # ── 基線：該書記同類人之死的正常比率 ──────────────────────
-def _attributable(s, nm, m, window, others):
-    """名字附近的終局用語是否可歸於本人。
+# 列傳開篇的定式「<名>字<某>，<籍貫>人也」是傳主姓名的現成來源。
+# 精度不高（約六到八成，且各書不均 —— 《魏書》多作「某，字某」，
+# 書志類還會把「一卷字」之類誤收），所以只拿它當**參照群體**，
+# 不當人名權威表。雜訊會稀釋比率，方向上偏保守。
+SUBJECT_RE = re.compile(r"([\u4e00-\u9fff]{2,4})，?字[\u4e00-\u9fff]{1,2}，")
+NOT_NAME = set("卷篇章一二三四五六七八九十百千第上下左右前後后書书年月日")
+# 姓氏表。沒有它，正則會把「字」前兩三個字一律當人名，於是《魏書》
+# 抓出「乃以墨涂」「之子磨奴」這類碎片 —— 雜訊名後面不會接「卒」,
+# 比率被壓到 7%，看起來像該書諱言死亡，其實是抓錯了名字。
+# 含北朝複姓，否則魏書、北史、周書的傳主會被整批漏掉。
+SURNAMES = set(
+    "趙赵錢钱孫孙李周吳吴鄭郑王馮冯陳陈褚衛卫蔣蒋沈韓韩楊杨朱秦尤許许何呂吕"
+    "施張张孔曹嚴严華华金魏陶姜戚謝谢鄒邹喻柏水竇窦章雲云蘇苏潘葛奚范彭郎魯鲁"
+    "韋韦昌馬马苗鳳凤花方俞任袁柳酆鮑鲍史唐費费廉岑薛雷賀贺倪湯汤滕殷羅罗畢毕"
+    "郝鄔邬安常樂乐于時时傅皮齊齐康伍余元卜顧顾孟平黃黄和穆蕭萧尹姚邵湛汪祁毛"
+    "禹狄米貝贝明臧計计伏成戴談谈宋茅龐庞熊紀纪舒屈項项祝董梁杜阮藍蓝閔闽席季"
+    "麻強强賈贾路婁娄危江童顏颜郭梅盛林刁鍾钟徐邱駱骆高夏蔡田樊胡凌霍虞萬万支"
+    "柯昝管盧卢莫經经房裘繆缪干解應应宗丁宣賁贲鄧邓郁單单杭洪包諸诸左石崔吉鈕"
+    "龔龚程嵇邢滑裴陸陆榮荣翁荀羊惠甄曲家封芮羿儲储靳汲邴糜松井段富巫烏乌焦巴"
+    "弓牧隗山谷車车侯宓蓬全郗班仰秋仲伊宮宫寧宁仇欒栾暴甘鈄厲厉戎祖武符劉刘景"
+    "詹束龍龙葉叶幸司韶郜黎薊蓟薄印宿白懷怀蒲邰從从鄂索咸籍賴赖卓藺蔺屠蒙池喬"
+    "喬乔陰阴胥能蒼苍雙双聞闻莘黨党翟譚谭貢贡勞劳逄姬申扶堵冉宰雍璩桑桂濮牛壽"
+    "壽寿通邊边扈燕冀郟浦尚農农溫温別别莊庄晏柴瞿閻阎充慕連连茹習习宦艾魚鱼容"
+    "向古易慎戈廖庾終终暨居衡步都耿滿满弘匡國国文寇廣广祿禄闕阙東东歐欧殳沃利"
+    "蔚越夔隆師师鞏巩厙库聶聂晁勾敖融冷訾辛闞阚那簡简饒饶空曾毋沙乜養养鞠須须"
+    "豐丰巢關关蒯相查后荊荆紅红游竺權权逯蓋盖益桓公万俟")
+COMPOUND_SURNAMES = (
+    "司馬", "司马", "慕容", "拓跋", "宇文", "長孫", "长孙", "獨孤", "独孤",
+    "尉遲", "尉迟", "賀蘭", "贺兰", "歐陽", "欧阳", "上官", "諸葛", "诸葛",
+    "夏侯", "皇甫", "公孫", "公孙", "赫連", "赫连", "万俟", "叱羅", "叱罗",
+    "乙弗", "吐谷", "斛斯", "步六孤", "丘穆陵", "紇骨", "纥骨", "普六茹",
+)
 
-    若名字與該用語之間夾著另一個對照名，這用語更可能是那個人的 ——
-    本紀一段之內常列數人數死，不加這個條件，基線會被鄰人的死灌水，
-    而基線一高，獨載的沉默就都顯得正常，遮掉真信號。
+
+def _looks_like_name(nm):
+    """捕到的字串像不像人名：以姓氏起頭。
+
+    這是精度的主要來源。沒有它，harvest 的雜訊會系統性地壓低比率,
+    而壓低的方向正好讓獨載的沉默顯得正常 —— 最危險的那個方向。
     """
-    a = max(0, m.start() - window)
-    b = min(len(s), m.end() + window)
-    for w in TERMINAL_LEX:
-        for g in re.finditer(re.escape(w), s[a:b]):
-            p0, p1 = a + g.start(), a + g.end()
-            if p1 <= m.start():
-                between = s[p1:m.start()]
-            elif p0 >= m.end():
-                between = s[m.end():p0]
-            else:
-                between = ""
-            if any(o in between for o in others):
-                continue                     # 中間隔著別人，不算本人的
-            return True
-    return False
+    if any(nm.startswith(c) for c in COMPOUND_SURNAMES):
+        return len(nm) >= 3
+    return nm[0] in SURNAMES
+# 樣本太小的比率不可用來調權重。n 低於此數即視同「無基線」。
+BASELINE_MIN_N = 20
 
 
-def terminal_rate(names, window=120):
+def reference_names(limit_per_book=400):
+    """各書的傳主姓名，作為基線的參照群體。
+
+    不用當次檢索結果當群體 —— 那只有十來個人，每部書的 n 落到個位數，
+    比率毫無意義（實測 n=1 時報 100%）。參照群體要大到比率站得住。
+    """
+    per = {}
+    for f in sorted(COR.rglob("*.txt")):
+        if any(w in f.name for w in ("译文", "譯文", "白话", "白話", "段译")):
+            continue
+        s = norm_text(f)
+        bag = per.setdefault(f.parts[1], set())
+        for m in SUBJECT_RE.finditer(s):
+            nm = m.group(1)
+            if len(nm) < 2 or any(c in NOT_NAME for c in nm):
+                continue
+            if not _looks_like_name(nm):
+                continue
+            bag.add(nm)
+    return {b: sorted(v)[:limit_per_book] for b, v in per.items()}
+
+SENT_END = "。！？；"
+
+
+def _attributable(s, nm, m, window, others=()):
+    """名字之後、同一句之內，是否緊接著終局用語。
+
+    初版取前後各 120 字的窗口，只要窗內出現終局用語就算。在真語料上
+    這完全不成立：「卒」在列傳裡俯拾即是（每篇傳記都以某人卒收尾），
+    於是任何在列傳中出現過的名字都會被算成「記其終」—— 實測三國志、
+    史記、後漢書全部報 100%。基線一旦普遍偏高，所有沉默都顯得正常，
+    獨載信號被整體抹平，比沒有基線更糟。
+
+    改成：終局用語必須出現在人名**之後**、且與人名**同句**（中間沒有
+    句讀），距離不超過 window 字。文言的死亡記述幾乎都是「某卒」
+    「某見殺」這樣緊接的寫法，所以這個條件嚴而不失。
+    """
+    seg = s[m.end():min(len(s), m.end() + window)]
+    cut = min([seg.find(c) for c in SENT_END if c in seg] or [len(seg)])
+    seg = seg[:cut]
+    if any(o in seg for o in others):        # 同句裡還有別人，歸屬不明
+        return False
+    return any(w in seg for w in TERMINAL_LEX)
+
+
+def terminal_rate(names, window=25):
     """每部書的「終局著錄率」。
 
     對每個（人名, 書）組合：該書若提及此人，其名前後 window 字內是否出現
@@ -313,18 +441,25 @@ def terminal_rate(names, window=120):
     詞表只收歧義小的詞，窗口也是拍的，所以比率有誤差。但它是**可審的**
     近似 —— 規則寫在這兒，可以指著說這條不對。
     """
+    per_book = names if isinstance(names, dict) else None
+    flat = None if per_book else [n for n in names
+                                  if len(n) >= 2 and n not in GENERIC_NAMES]
     stat = {}
     for f in sorted(COR.rglob("*.txt")):
         if any(w in f.name for w in ("译文", "譯文", "白话", "白話", "段译")):
             continue
         book = f.parts[1]
+        pool = per_book.get(book, []) if per_book else flat
+        if not pool:
+            continue
         s = norm_text(f)
-        for nm in names:
+        for nm in pool:
             if nm not in s:
                 continue
             d = stat.setdefault(book, {"seen": set(), "term": set()})
             d["seen"].add(nm)
-            others = [o for o in names if o != nm and o not in nm]
+            # others 不可省：同句裡若還有別人，那句的「見殺」歸誰並不確定
+            others = [o for o in pool if o != nm and o not in nm]
             for m in re.finditer(re.escape(nm), s):
                 if _attributable(s, nm, m, window, others):
                     d["term"].add(nm)
@@ -332,7 +467,8 @@ def terminal_rate(names, window=120):
     out = {}
     for book, d in stat.items():
         n, k = len(d["seen"]), len(d["term"])
-        out[book] = {"n": n, "k": k, "rate": (k / n) if n else None}
+        out[book] = {"n": n, "k": k, "rate": (k / n) if n else None,
+                     "usable": n >= BASELINE_MIN_N}
     return out
 
 
@@ -356,18 +492,31 @@ def _names_from_work(w):
 def cmd_baseline(a):
     """算基線並寫入 work/baseline.json，供 verify 校準獨載權重。"""
     w = pathlib.Path(a.out)
-    names = _names_from_work(w)
-    if not names:
-        sys.exit(f"{w} 裡找不到人名（需先跑 verify 或抽取）")
-    print(f"對照群體 {len(names)} 人：{'、'.join(names[:10])}"
-          f"{'…' if len(names) > 10 else ''}\n", file=sys.stderr)
+    if a.cohort == "findings":
+        names = _names_from_work(w)
+        if not names:
+            sys.exit(f"{w} 裡找不到人名（需先跑 verify 或抽取）")
+        print(f"參照群體＝本次檢索結果，{len(names)} 人。", file=sys.stderr)
+        print("  注意：這樣每部書的 n 只有個位數，比率站不住；"
+              "正式用請改 --cohort reference。", file=sys.stderr)
+    else:
+        names = reference_names(a.limit)
+        tot = len({n for v in names.values() for n in v})
+        print(f"參照群體＝各書傳主姓名，共 {tot:,} 人（每書上限 {a.limit}）。",
+              file=sys.stderr)
+        print("  來源是列傳開篇定式「某字某，某地人也」，精度約六到八成；"
+              "雜訊會稀釋比率，方向偏保守。", file=sys.stderr)
     base = terminal_rate(names, a.window)
     _dump(w / "baseline.json", base)
-    print(f"{'書':10s} {'提及':>5s} {'記其終':>6s} {'著錄率':>7s}")
+    print(f"{'書':10s} {'提及':>5s} {'記其終':>6s} {'著錄率':>7s}  可用")
     for b, d in sorted(base.items(), key=lambda x: -(x[1]["rate"] or 0)):
-        print(f"{b:10s} {d['n']:5d} {d['k']:6d} {d['rate']:7.0%}")
-    print(f"\n→ {w}/baseline.json　下次 verify 會自動讀取並據以校準獨載權重",
-          file=sys.stderr)
+        print(f"{b:10s} {d['n']:5d} {d['k']:6d} {d['rate']:7.0%}"
+              f"  {'是' if d['usable'] else f'否（n<{BASELINE_MIN_N}）'}")
+    bad = [b for b, d in base.items() if not d["usable"]]
+    if bad:
+        print(f"\n{len(bad)} 部書的樣本不足（n<{BASELINE_MIN_N}），"
+              f"其比率不會用來調權重：{'、'.join(bad)}", file=sys.stderr)
+    print(f"\n→ {w}/baseline.json", file=sys.stderr)
 
 
 # ── 知異：已知集合減法 ────────────────────────────────────
@@ -583,8 +732,22 @@ def apply_aliases(rows, amap):
     return n
 
 
+def _distinct_times(times):
+    """把彼此相容的紀年寫法收成一個。
+
+    檢索窗口只有兩百字，年號常落在窗外：《魏書》帝紀作「二年二月」,
+    列傳作「延昌二年二月」，其實同一天。一方是另一方的後綴時，
+    那是上下文缺失，不是歧異 —— 舊規則把它報成強信號。
+    """
+    out = []
+    for t in sorted(times, key=len, reverse=True):
+        if not any(t in kept for kept in out):
+            out.append(t)
+    return out
+
+
 # ── 確定性層：矛盾 / 歧異 / 獨載 ──────────────────────────
-def analyse(rows, all_stances, baseline=None):
+def analyse(rows, all_stances, baseline=None, pairs=None):
     people = {}
     for r in rows:
         people.setdefault(r["person"], []).append(r)
@@ -599,16 +762,22 @@ def analyse(rows, all_stances, baseline=None):
         if len(term) > 1:
             flags.append((5, f"終局互斥：{' ↔ '.join(term)}",
                           "同一人被記為兩種不相容的結局，必有一方曲筆。"))
-        for x, y in PAIRS:
+        for x, y in (PAIRS if pairs is None else pairs):
             if x in acts and y in acts:
                 flags.append((4, f"記載互斥：{x} ↔ {y}", "兩處斷言不能同真。"))
 
+        # 紀年歧異只對「一生只能發生一次」的行為成立。
+        # 實測教訓：張稷在《梁書》本紀裡五度除授，舊規則把四個不同的
+        # 任命當成「同一事繫於不同時間」，報了一條假歧異。除授、征战、
+        # 赴任這類可以反覆發生，時間不同本是常態。
         by_act = {}
         for h in hits:
             if h.get("time"):
                 for a in h.get("acts", []):
-                    by_act.setdefault(a, set()).add(h["time"])
+                    if a in TERMINAL:                 # 終局只能有一次
+                        by_act.setdefault(a, set()).add(h["time"])
         for a, ts in by_act.items():
+            ts = _distinct_times(ts)
             if len(ts) > 1:
                 flags.append((4, f"紀年歧異（{a}）：{' / '.join(sorted(ts))}",
                               "同一事繫於不同時間，考異之常見入口。"))
@@ -629,7 +798,10 @@ def analyse(rows, all_stances, baseline=None):
                     rs = [(b, baseline[b]["rate"], baseline[b]["n"])
                           for b in sb
                           if baseline and b in baseline
-                          and baseline[b].get("rate") is not None]
+                          and baseline[b].get("rate") is not None
+                          # 樣本不足的比率不可用來調權重：0/3 與 0/300
+                          # 在數字上都是 0%，證據力卻差了兩個數量級。
+                          and baseline[b].get("n", 0) >= BASELINE_MIN_N]
                     if rs:
                         bk, rate, n = max(rs, key=lambda x: x[1])
                         why += f"\n      基線：《{bk}》對同類人物的終局著錄率 " \
@@ -693,7 +865,8 @@ def cmd_run(a):
     if a.dry_run:
         print(f"\n--dry-run：本次會發出上列請求，未實際呼叫 API。", file=sys.stderr)
         return
-    res = analyse(rows, sorted({h.stance for h in hits}))
+    res = analyse(rows, sorted({h.stance for h in hits}), None,
+                  _pairs(getattr(a, "demo_bad_rule", False)))
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     json.dump(res, (out / f"{a.term}_findings.json").open("w", encoding="utf-8"),
@@ -784,6 +957,45 @@ def cmd_chunks(a):
     print(f"       結果寫入 {w}/extracted.json（格式見 README）")
 
 
+# 帝號、廟號、泛稱：出現在每一卷裡，當人名檢索毫無分辨力。
+GENERIC_NAMES = {
+    "帝", "上", "王", "公", "侯", "君", "太祖", "高祖", "世祖", "太宗",
+    "高宗", "世宗", "中宗", "肅宗", "肃宗", "顯祖", "显祖", "獻帝", "献帝",
+    "太后", "皇后", "太子", "天子", "朕", "臣", "將軍", "将军", "刺史",
+}
+# 一個真實人物的名字，在二十四史全文裡出現上千次是不合理的（劉裕 210 次）。
+# 超過這個數的多半是泛稱、官稱，或與常用詞撞字。
+NAME_FREQ_MAX = 1000
+
+
+def _usable_names(names):
+    """挑出能用來做全庫檢索的人名，並說明被篩掉的理由。
+
+    抽取規格刻意要求 person 照原文寫法、不補姓氏，於是必然出現
+    「恩」「翼」「昶」這類單字名；而階段二要拿人名去掃全語料 ——
+    「帝」在這份語料裡出現 59,084 次，拿它當人名檢索只會灌出幾千個
+    無意義的 chunk，把真正的比對埋掉。所以這裡必須先篩。
+    """
+    texts = None
+    keep, drop = [], []
+    for n in names:
+        if len(n) < 2:
+            drop.append((n, "單字名，無分辨力"))
+            continue
+        if n in GENERIC_NAMES:
+            drop.append((n, "帝號或泛稱，非人名"))
+            continue
+        if texts is None:                  # 只在真要數的時候才讀全語料
+            texts = [f.read_text(encoding="utf-8")
+                     for f in sorted(COR.rglob("*.txt"))]
+        c = sum(t.count(n) for t in texts)
+        if c > NAME_FREQ_MAX:
+            drop.append((n, f"全語料出現 {c:,} 次，過於常見"))
+        else:
+            keep.append(n)
+    return keep, drop
+
+
 def cmd_expand(a):
     """階段二：用階段一抽出的人名，全語料重新檢索
 
@@ -795,6 +1007,16 @@ def cmd_expand(a):
     names = sorted({i["person"] for i in items if i.get("person")})
     if not names:
         sys.exit("extracted.json 裡沒有人名")
+    names, dropped_names = _usable_names(names)
+    if dropped_names:
+        print(f"篩掉 {len(dropped_names)} 個不能用於全庫檢索的寫法：",
+              file=sys.stderr)
+        for n, why in dropped_names:
+            print(f"  ✗ {n}　{why}", file=sys.stderr)
+        print("  這些人要進階段二，得先在 aliases.json 裡把它們歸一到全名"
+              "（如 恩→孫恩），或用 --also 直接給全名。", file=sys.stderr)
+    if not names:
+        sys.exit("篩完沒有可用人名。先做人名歸一，或用 chunks --also 給全名。")
     terms = []
     for n in names:
         terms += variants(n)
@@ -888,7 +1110,8 @@ def cmd_verify(a):
     else:
         print("提示：尚無基線。跑 `python huijian.py baseline "
               f"{w}` 可校準終局獨載的權重", file=sys.stderr)
-    res = analyse(uniq, sorted({r["stance"] for r in uniq}), base)
+    res = analyse(uniq, sorted({r["stance"] for r in uniq}), base,
+                  _pairs(getattr(a, "demo_bad_rule", False)))
 
     zy = load_zhiyi(w)
     if zy is None:
@@ -941,17 +1164,27 @@ def main():
             p.add_argument("--limit", type=int, default=0, help="最多呼叫幾次 API（控成本）")
             p.add_argument("--dry-run", action="store_true", help="只列出將發出的請求")
             p.add_argument("--debug", action="store_true", help="逐條列印模型返回與攔截")
+            p.add_argument("--demo-bad-rule", action="store_true",
+                           help="啟用故意的錯誤規則，看它如何誤報")
         p.set_defaults(fn=fn)
     for nm, fn in [("expand", cmd_expand), ("verify", cmd_verify),
                    ("baseline", cmd_baseline), ("null", cmd_null)]:
         q = sub.add_parser(nm)
         q.add_argument("out", help="工作目錄")
         q.add_argument("--window", type=int, default=200)
+        if nm == "baseline":
+            q.add_argument("--cohort", choices=("reference", "findings"),
+                           default="reference",
+                           help="參照群體：各書傳主（預設）或本次檢索結果")
+            q.add_argument("--limit", type=int, default=400,
+                           help="每書取多少傳主作參照，預設 400")
         if nm == "null":
             q.add_argument("--iters", type=int, default=500,
                            help="置換次數，預設 500")
             q.add_argument("--seed", type=int, default=0, help="隨機種子，便於復現")
         if nm == "verify":
+            q.add_argument("--demo-bad-rule", action="store_true",
+                           help="啟用故意的錯誤規則，看它如何誤報")
             q.add_argument("--strict", action="store_true",
                            help="按地址從語料重新切片逐字核對（需 corpus/ 在位）")
         q.set_defaults(fn=fn)

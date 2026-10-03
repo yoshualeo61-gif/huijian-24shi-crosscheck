@@ -1,317 +1,426 @@
-import React, { useState } from "react";
-import { Play, Plus, X, Check, HelpCircle, Ban, Download, ShieldCheck, AlertTriangle, Users } from "lucide-react";
+import React, { useMemo, useState } from "react";
+import { Check, HelpCircle, Ban, Download, Upload, AlertTriangle, Eye, PenLine } from "lucide-react";
 
-/* ── 朱墨套印 ─────────────────────────────────── */
+/*
+  互見 · 標注界面
+
+  這個界面**不做判定**。
+
+  早先的版本在 JS 裡重寫了一遍確定性層（chunk、逐字校驗、矛盾／獨載判定），
+  還用模型做人物歸一。結果是同一份材料、兩套程式、兩種結論，而使用者無從
+  察覺哪一套是對的；模型歸一更是把判斷交回給模型，正是本專案的設計要排除
+  的那一類錯誤（「模型直接下判斷 → 不能發現」）。
+
+  所以現在：判定一律由 Python 產出，這裡只做兩件事 ——
+
+    看  讀 work/findings.json，照 Python 算好的權重與旗標顯示，不重算。
+    標  讀 biaozhu.py sample 產出的標注檔，記錄人的判斷，匯出回去給
+        biaozhu.py score 計分。
+
+  按鈕上的可選值與每軌的指南都從標注檔的 meta 讀取，不在此處另抄一份 ——
+  抄一份就會各自漂移，而漂移是查不出來的。
+
+  也因此這個界面不呼叫任何 API，不需要 key，離線可用。
+*/
+
 const C = {
   ink: "#13151B", panel: "#1B1E27", line: "#2B303E", paper: "#EAE5D9",
   zhu: "#D8483A", qing: "#4A80AE", gold: "#B08A44", mute: "#848B99", text: "#D5D8DF",
 };
 const SERIF = "'Songti SC','Noto Serif CJK SC','Source Han Serif SC','SimSun',serif";
 
-/* ── 行为类型 ─────────────────────────────────── */
-const ACTS = [
-  "除授", "罢黜", "赴任", "征战", "战胜", "战败",
-  "死于战", "病卒", "被杀", "归降", "被俘", "叛乱",
-  "筑城", "赈济", "上书", "出使", "逃亡", "受封赏",
-];
+const TRACK_NAME = { A: "抽取精度", B: "信號效度", C: "負對照（攔截）" };
 
-/* 终局互斥集：任两者并存即为硬矛盾 */
-const TERMINAL = ["死于战", "病卒", "被杀", "归降", "被俘"];
-const PAIRS = [["战胜", "战败"], ["除授", "罢黜"]];
+/* 判斷值的顏色：肯定／保留／否定三類，其餘中性 */
+const VAL_COLOR = (v) => {
+  if (["ok", "correct", "yes"].includes(v)) return C.qing;
+  if (["undecidable", "na"].includes(v)) return C.gold;
+  if (["wrong", "unsupported", "false_reject", "no"].includes(v)) return C.zhu;
+  return C.mute;
+};
 
-/* ── 模型层：只做抽取 ─────────────────────────── */
-async function callModel(prompt) {
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }),
-  });
-  const d = await r.json();
-  const raw = d.content.filter(b => b.type === "text").map(b => b.text).join("");
-  const s = raw.replace(/```json|```/g, "").trim();
-  const a = s.indexOf("["), b = s.lastIndexOf("]");
-  if (a < 0 || b < 0) return [];
-  return JSON.parse(s.slice(a, b + 1));
+function Panel({ children, style }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, ...style }}
+      className="rounded p-4">{children}</div>
+  );
 }
 
-const extractPrompt = (t) => `你是史料抽取器。只抽取，不判断，不推论。
-
-铁律：
-1. 只记录原文明确写了的。不得补全、演绎、据常识推断。
-2. evidence 必须是原文中逐字连续的片段，一字不改。
-3. 无可抽者返回 []。宁可空，不可凑。
-4. person 用原文出现的写法（"善明"就写"善明"，不要自行补成"刘善明"）。
-
-acts 只能选自：${ACTS.join("、")}
-
-只输出 JSON 数组，无 markdown，无解释：
-[{"person":"","title":"","place":"","time":"","acts":[],"evidence":""}]
-
-史料：
-<<<${t}>>>`;
-
-const aliasPrompt = (names, ctx) => `以下是从同一批史料中抽出的人物写法，可能包含同一人的不同称谓（本名、单名、字、官称）。
-
-请判断哪些指同一人。只依据所附原文语境，不得引入外部知识。不确定则各自独立成组。
-
-写法与语境：
-${ctx}
-
-只输出 JSON 数组，每组一个数组，单独成组的也要列出：
-[["写法A","写法B"],["写法C"]]
-
-待归组：${JSON.stringify(names)}`;
-
-/* ── 代码层：确定性推断 ───────────────────────── */
-function chunkText(t, n) {
-  const out = []; let b = "";
-  for (const s of t.split(/(?<=[。！？；\n])/)) {
-    if ((b + s).length > n && b) { out.push(b); b = s; } else b += s;
-  }
-  if (b.trim()) out.push(b);
-  return out;
+function Quote({ children }) {
+  return (
+    <div style={{ fontFamily: SERIF, color: C.paper, borderLeft: `2px solid ${C.zhu}` }}
+      className="pl-3 py-1 text-base leading-relaxed">「{children}」</div>
+  );
 }
 
-function verifySpans(items, src) {
-  const ok = [], bad = [];
-  for (const it of items) {
-    const e = (it.evidence || "").trim();
-    (e.length >= 4 && src.includes(e) ? ok : bad).push({ ...it, evidence: e });
-  }
-  return { ok, bad };
+/* ── 讀檔 ─────────────────────────────────────── */
+function readFile(file, onDone, onErr) {
+  const r = new FileReader();
+  r.onload = () => {
+    try { onDone(JSON.parse(String(r.result))); }
+    catch (e) { onErr(`JSON 解析失敗：${e.message}`); }
+  };
+  r.onerror = () => onErr("讀檔失敗");
+  r.readAsText(file, "utf-8");
 }
 
-function analyse(rows, groups, allStances) {
-  const key = new Map();
-  groups.forEach(g => g.forEach(n => key.set(n, g[0])));
+/* 標注檔：{meta, items}；findings：陣列且元素有 flags/hits */
+const shapeOf = (d) => {
+  if (d && !Array.isArray(d) && Array.isArray(d.items)) return "annot";
+  if (Array.isArray(d) && d.length && d[0] && Array.isArray(d[0].hits)) return "findings";
+  if (Array.isArray(d) && d.length && d[0] && d[0].track) return "annot-bare";
+  return null;
+};
 
-  const byId = new Map();
-  for (const r of rows) {
-    const id = key.get(r.person) || r.person;
-    if (!byId.has(id)) byId.set(id, { id, aliases: new Set(), hits: [] });
-    byId.get(id).aliases.add(r.person);
-    byId.get(id).hits.push(r);
-  }
+/* ── 檢視：顯示 Python 的判定，不重算 ───────────── */
+function FindingsView({ data }) {
+  return (
+    <div className="space-y-3">
+      <Panel style={{ borderColor: C.qing }}>
+        <div className="flex gap-2 items-start text-xs" style={{ color: C.mute }}>
+          <Eye size={14} style={{ color: C.qing, flexShrink: 0, marginTop: 2 }} />
+          <span>
+            以下權重與旗標全部由 <code>huijian.py verify</code> 算出，此處照原樣顯示。
+            本界面不參與判定，所以不會與命令列給出不同的結論。
+          </span>
+        </div>
+      </Panel>
 
-  const out = [];
-  for (const p of byId.values()) {
-    const stances = [...new Set(p.hits.map(h => h.stance))];
-    const acts = [...new Set(p.hits.flatMap(h => h.acts || []))];
-    const flags = [];
+      {data.map((p, i) => (
+        <Panel key={i}>
+          <div className="flex items-baseline gap-3 flex-wrap">
+            <span style={{ fontFamily: SERIF, color: C.paper }} className="text-lg">
+              {p.person}</span>
+            <span className="text-xs" style={{ color: C.qing }}>
+              {(p.stances || []).join(" | ")}</span>
+            <span className="text-xs" style={{ color: C.gold }}>權重 {p.score}</span>
+            {p.person_raw && p.person_raw !== p.person && (
+              <span className="text-xs" style={{ color: C.mute }}>
+                抽取原作「{p.person_raw}」</span>)}
+          </div>
 
-    const term = acts.filter(a => TERMINAL.includes(a));
-    if (term.length > 1)
-      flags.push({ w: 5, k: `终局互斥：${term.join(" ↔ ")}`, why: "同一人被记为两种不相容的结局，必有一方曲笔。" });
-    for (const [a, b] of PAIRS)
-      if (acts.includes(a) && acts.includes(b))
-        flags.push({ w: 4, k: `记载互斥：${a} ↔ ${b}`, why: "两处断言不能同真。" });
+          {(p.known || []).map((k, j) => (
+            <div key={j} className="text-xs mt-2" style={{ color: C.gold }}>
+              ◆ 考異已及{k.topic ? `（${k.topic}）` : ""}：{k.source || "未註明出處"}
+            </div>
+          ))}
 
-    /* 纪年歧异 */
-    const byAct = new Map();
-    for (const h of p.hits) for (const a of (h.acts || [])) {
-      if (!h.time) continue;
-      if (!byAct.has(a)) byAct.set(a, new Set());
-      byAct.get(a).add(h.time);
+          <div className="mt-3 space-y-2">
+            {(p.flags || []).map((f, j) => {
+              const [w, k, why] = Array.isArray(f) ? f : [f.w, f.k, f.why];
+              return (
+                <div key={j} className="text-sm">
+                  <span style={{ color: w >= 4 ? C.zhu : C.mute }}>
+                    {w >= 4 ? "⚠" : "·"} {k}</span>
+                  <div className="text-xs mt-1 whitespace-pre-line"
+                    style={{ color: C.mute }}>{why}</div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-3 space-y-2">
+            {(p.hits || []).map((h, j) => (
+              <div key={j}>
+                <div className="text-xs" style={{ color: C.mute }}>
+                  〔{h.stance}〕《{h.book}·{h.juan}》 {h.time || "—"}
+                  {h.ev_start != null && <span> · 位址 {h.ev_start}–{h.ev_end}</span>}
+                  {h.acts && h.acts.length ? ` · ${h.acts.join("、")}` : ""}
+                </div>
+                <Quote>{h.evidence}</Quote>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      ))}
+    </div>
+  );
+}
+
+/* ── 標注 ─────────────────────────────────────── */
+function AnnotView({ doc, setDoc }) {
+  const meta = doc.meta || {};
+  const values = meta.values || {};
+  const guide = meta.guide || {};
+  const items = doc.items || [];
+  const [track, setTrack] = useState("A");
+  const [onlyTodo, setOnlyTodo] = useState(false);
+
+  const judged = (it) =>
+    Object.values(it.verdict || {}).some((v) => v !== null && v !== undefined);
+
+  const shown = items.filter((it) => it.track === track && (!onlyTodo || !judged(it)));
+  const stat = useMemo(() => {
+    const s = {};
+    for (const it of items) {
+      s[it.track] = s[it.track] || { n: 0, done: 0 };
+      s[it.track].n++;
+      if (judged(it)) s[it.track].done++;
     }
-    for (const [a, ts] of byAct)
-      if (ts.size > 1)
-        flags.push({ w: 4, k: `纪年歧异（${a}）：${[...ts].join(" / ")}`, why: "同一事系于不同时间，考异之常见入口。" });
+    return s;
+  }, [items]);
 
-    /* 单方独载 —— 只标记，不断言 */
-    const missing = allStances.filter(s => !stances.includes(s));
-    if (allStances.length > 1 && missing.length)
-      flags.push({ w: 3, k: `仅见于「${stances.join("、")}」`, why: `「${missing.join("、")}」无载。可能是讳饰，也可能该书本不记此类事，或材料散佚。需比对同类人物的正常著录率再判断。` });
+  const set = (id, field, v) =>
+    setDoc({
+      ...doc,
+      items: items.map((it) =>
+        it.id === id
+          ? { ...it, verdict: { ...it.verdict, [field]: it.verdict?.[field] === v ? null : v } }
+          : it),
+    });
 
-    if (p.hits.length > 1 && !flags.length)
-      flags.push({ w: 1, k: "多处互见，无冲突", why: "记载彼此一致，可作为交叉佐证。" });
-
-    out.push({ ...p, aliases: [...p.aliases], stances, acts, flags, score: flags.reduce((s, f) => s + f.w, 0) });
-  }
-  return out.sort((a, b) => b.score - a.score);
-}
-
-/* ── 界面 ─────────────────────────────────────── */
-export default function App() {
-  const [srcs, setSrcs] = useState([
-    { id: 1, name: "史源甲", stance: "南朝", text: "" },
-    { id: 2, name: "史源乙", stance: "北朝", text: "" },
-  ]);
-  const [size, setSize] = useState(700);
-  const [busy, setBusy] = useState(false);
-  const [prog, setProg] = useState("");
-  const [res, setRes] = useState(null);
-  const [drop, setDrop] = useState(0);
-  const [marks, setMarks] = useState({});
-  const [err, setErr] = useState("");
-
-  const upd = (id, k, v) => setSrcs(s => s.map(x => x.id === id ? { ...x, [k]: v } : x));
-
-  async function run() {
-    setBusy(true); setErr(""); setRes(null); setMarks({}); setDrop(0);
-    try {
-      const live = srcs.filter(s => s.text.trim());
-      if (!live.length) throw new Error("先贴史料。");
-
-      const rows = []; let bad = 0;
-      for (const s of live) {
-        const cks = chunkText(s.text, size);
-        for (let i = 0; i < cks.length; i++) {
-          setProg(`抽取 ${s.name} · ${i + 1}/${cks.length}`);
-          let items = [];
-          try { items = await callModel(extractPrompt(cks[i])); } catch { items = []; }
-          const { ok, bad: b } = verifySpans(items, cks[i]);
-          bad += b.length;
-          ok.forEach(o => o.person && rows.push({ ...o, stance: s.stance, src: s.name, chunk: i + 1 }));
-        }
-      }
-      setDrop(bad);
-
-      const names = [...new Set(rows.map(r => r.person))];
-      let groups = names.map(n => [n]);
-      if (names.length > 1) {
-        setProg("人物归一…");
-        const ctx = rows.slice(0, 40).map(r => `${r.person}｜${r.title || "—"}｜${r.evidence.slice(0, 30)}`).join("\n");
-        try {
-          const g = await callModel(aliasPrompt(names, ctx));
-          if (Array.isArray(g) && g.length) groups = g.filter(x => Array.isArray(x) && x.length);
-        } catch { /* 归一失败则各自独立 */ }
-      }
-
-      setRes(analyse(rows, groups, [...new Set(live.map(s => s.stance))]));
-    } catch (e) { setErr(String(e.message || e)); }
-    setBusy(false); setProg("");
-  }
+  const note = (id, v) =>
+    setDoc({ ...doc, items: items.map((it) => (it.id === id ? { ...it, note: v } : it)) });
 
   const exportJSON = () => {
-    const blob = new Blob([JSON.stringify(res.map(p => ({ ...p, 人工判定: marks[p.id] || "未判" })), null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(doc, null, 1)], { type: "application/json" });
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob); a.download = "shiliao_findings.json"; a.click();
+    a.href = URL.createObjectURL(blob);
+    a.download = "annot_judged.json";
+    a.click();
   };
 
-  const MARK = [
-    { v: "核实", i: Check, c: C.qing }, { v: "存疑", i: HelpCircle, c: C.gold }, { v: "否定", i: Ban, c: C.zhu },
-  ];
+  return (
+    <div className="space-y-3">
+      <Panel>
+        <div className="flex flex-wrap gap-2 items-center justify-between">
+          <div className="flex gap-2">
+            {["A", "B", "C"].map((t) => {
+              const st = stat[t];
+              return (
+                <button key={t} onClick={() => setTrack(t)} disabled={!st}
+                  style={{
+                    background: track === t ? C.zhu : "transparent",
+                    border: `1px solid ${track === t ? C.zhu : C.line}`,
+                    color: st ? (track === t ? C.paper : C.text) : C.line,
+                  }} className="px-3 py-1 rounded text-xs">
+                  {t} · {TRACK_NAME[t]}{st ? ` ${st.done}/${st.n}` : " 0"}
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex gap-3 items-center">
+            <label className="text-xs flex gap-1 items-center" style={{ color: C.mute }}>
+              <input type="checkbox" checked={onlyTodo}
+                onChange={(e) => setOnlyTodo(e.target.checked)} />
+              只看未標
+            </label>
+            <button onClick={exportJSON}
+              style={{ background: C.qing, color: C.ink }}
+              className="px-3 py-1 rounded text-xs flex gap-1 items-center">
+              <Download size={13} /> 匯出
+            </button>
+          </div>
+        </div>
+        <div className="text-xs mt-3" style={{ color: C.mute }}>
+          匯出後交給 <code>python biaozhu.py score work/ --name annot_judged.json</code> 計分。
+          兩人各標一份，再加 <code>--second</code> 就能算 κ。
+        </div>
+      </Panel>
+
+      {(guide[track] || []).length > 0 && (
+        <Panel style={{ borderColor: C.gold }}>
+          <div className="text-xs mb-1" style={{ color: C.gold }}>
+            {track} 軌判斷指南（取自標注檔，與命令列的本子同源）
+          </div>
+          {guide[track].map((g, i) => (
+            <div key={i} className="text-xs leading-relaxed" style={{ color: C.mute }}>{g}</div>
+          ))}
+        </Panel>
+      )}
+
+      {shown.length === 0 && (
+        <Panel><div className="text-xs" style={{ color: C.mute }}>
+          這一軌沒有待顯示的條目。</div></Panel>
+      )}
+
+      {shown.map((it) => (
+        <Panel key={it.id}>
+          <div className="flex items-baseline gap-3 flex-wrap">
+            <span style={{ color: C.gold }} className="text-xs">{it.id}</span>
+            {it.track === "A" && (
+              <span className="text-xs" style={{ color: C.mute }}>
+                《{it.book}·{it.juan}》[{it.stance}]
+                {it.addr && it.addr[0] != null ? ` 位址 ${it.addr[0]}–${it.addr[1]}` : ""}
+              </span>
+            )}
+            {it.track === "B" && (
+              <span className="text-xs" style={{ color: C.mute }}>
+                {it.person} · 權重 {it.weight}</span>
+            )}
+            {it.track === "C" && (
+              <span className="text-xs" style={{ color: C.zhu }}>
+                攔截理由：{it.why_rejected}</span>
+            )}
+          </div>
+
+          {it.track === "A" && (
+            <div className="mt-2">
+              <div className="text-xs" style={{ color: C.mute }}>
+                person=<b style={{ color: C.text }}>{String(it.person)}</b>
+                {"  "}title={String(it.title || "")}
+                {"  "}place={String(it.place || "")}
+                {"  "}time={String(it.time || "")}
+              </div>
+              <div className="text-xs" style={{ color: C.mute }}>
+                acts={(it.acts || []).join("、") || "—"}
+              </div>
+              {it.person_normalized && it.person_normalized !== it.person && (
+                <div className="text-xs mt-1" style={{ color: C.gold }}>
+                  歸一後作「{it.person_normalized}」—— 人工確認過的合併，不在本軌評判範圍
+                </div>
+              )}
+              <Quote>{it.evidence}</Quote>
+            </div>
+          )}
+
+          {it.track === "B" && (
+            <div className="mt-2">
+              <div className="text-sm" style={{ color: C.text }}>旗標：{it.flag}</div>
+              <div className="text-xs mt-1 whitespace-pre-line" style={{ color: C.mute }}>
+                {it.why}</div>
+              <div className="mt-2 space-y-2">
+                {(it.hits || []).map((h, j) => (
+                  <div key={j}>
+                    <div className="text-xs" style={{ color: C.mute }}>
+                      〔{h.stance}〕《{h.book}·{h.juan}》 {h.time || "—"}
+                      {h.acts && h.acts.length ? ` · ${h.acts.join("、")}` : ""}
+                    </div>
+                    <Quote>{h.evidence}</Quote>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {it.track === "C" && (
+            <div className="mt-2">
+              <div className="text-xs" style={{ color: C.mute }}>
+                《{it.book}·{it.juan}》 person={String(it.person || "")}
+                {"  "}是否為 chunk 子串：{String(it.evidence_in_chunk_substring)}
+              </div>
+              <div className="text-xs mt-1" style={{ color: C.mute }}>聲稱引文：</div>
+              <Quote>{it.evidence}</Quote>
+              <div className="text-xs mt-2" style={{ color: C.mute }}>chunk：</div>
+              <div style={{ fontFamily: SERIF, color: C.text, background: C.ink }}
+                className="text-sm p-2 rounded max-h-40 overflow-auto whitespace-pre-wrap">
+                {it.chunk}
+              </div>
+            </div>
+          )}
+
+          <div className="mt-3 space-y-2">
+            {Object.entries(values[it.track] || {}).map(([field, opts]) => (
+              <div key={field} className="flex flex-wrap gap-2 items-center">
+                <span className="text-xs w-28" style={{ color: C.mute }}>{field}</span>
+                {opts.map((v) => {
+                  const on = it.verdict?.[field] === v;
+                  return (
+                    <button key={v} onClick={() => set(it.id, field, v)}
+                      style={{
+                        background: on ? VAL_COLOR(v) : "transparent",
+                        border: `1px solid ${on ? VAL_COLOR(v) : C.line}`,
+                        color: on ? C.ink : C.text,
+                      }} className="px-2 py-0.5 rounded text-xs">{v}</button>
+                  );
+                })}
+              </div>
+            ))}
+            <input value={it.note || ""} onChange={(e) => note(it.id, e.target.value)}
+              placeholder="備註（可空）"
+              style={{ background: C.ink, border: `1px solid ${C.line}`, color: C.text }}
+              className="w-full px-2 py-1 rounded text-xs" />
+          </div>
+        </Panel>
+      ))}
+    </div>
+  );
+}
+
+/* ── 殼 ───────────────────────────────────────── */
+export default function App() {
+  const [doc, setDoc] = useState(null);
+  const [findings, setFindings] = useState(null);
+  const [err, setErr] = useState("");
+
+  const load = (f) => {
+    setErr("");
+    readFile(f, (d) => {
+      const k = shapeOf(d);
+      if (k === "annot") setDoc(d);
+      else if (k === "annot-bare") setDoc({ meta: {}, items: d });
+      else if (k === "findings") setFindings(d);
+      else setErr("認不出這個檔。請給 biaozhu.py sample 產出的標注檔，或 findings.json。");
+    }, setErr);
+  };
 
   return (
     <div style={{ background: C.ink, color: C.text, minHeight: "100%" }} className="p-5">
       <div className="max-w-5xl mx-auto">
 
-        <div className="flex items-baseline gap-3 mb-1">
+        <div className="flex items-baseline gap-3 mb-1 flex-wrap">
           <h1 style={{ fontFamily: SERIF, color: C.paper }} className="text-2xl">互見</h1>
-          <span style={{ color: C.zhu }} className="text-xs tracking-widest">史料交叉比對</span>
+          <span style={{ color: C.zhu }} className="text-xs tracking-widest">標注界面</span>
         </div>
-        <p style={{ color: C.mute }} className="text-xs mb-5 leading-relaxed">
-          模型只做抽取與人物歸一；矛盾、歧異、獨載全部由程式判定，邏輯可審。
-          凡引文未在原文逐字出現者一律丟棄。每條結論須回查原文。
-        </p>
+        <div className="text-xs mb-4" style={{ color: C.mute }}>
+          判定由 <code>huijian.py</code> 產出；此處只負責顯示與記錄人的判斷，不重算、不呼叫模型。
+        </div>
 
-        <div className="grid md:grid-cols-2 gap-3 mb-4">
-          {srcs.map(s => (
-            <div key={s.id} style={{ background: C.panel, border: `1px solid ${C.line}` }} className="rounded p-3">
-              <div className="flex items-center gap-2 mb-2">
-                <input value={s.name} onChange={e => upd(s.id, "name", e.target.value)}
-                  style={{ background: "transparent", color: C.paper, borderBottom: `1px solid ${C.line}` }}
-                  className="text-sm flex-1 outline-none py-1" />
-                <input value={s.stance} onChange={e => upd(s.id, "stance", e.target.value)}
-                  style={{ background: C.ink, color: C.qing, border: `1px solid ${C.line}` }}
-                  className="text-xs rounded px-2 py-1 w-20 outline-none" placeholder="立場" />
-                {srcs.length > 1 && <button onClick={() => setSrcs(x => x.filter(y => y.id !== s.id))}
-                  style={{ color: C.mute }}><X size={14} /></button>}
-              </div>
-              <textarea value={s.text} onChange={e => upd(s.id, "text", e.target.value)}
-                placeholder="貼一卷史料。立場欄可填「南朝／北朝」「官修／私撰」「宋／金」等，用於偵測單方獨載。"
-                style={{ background: C.paper, color: "#1A1A1A", fontFamily: SERIF, lineHeight: 1.9 }}
-                className="w-full h-40 rounded p-3 text-sm outline-none resize-y" />
+        <Panel style={{ borderColor: C.zhu, marginBottom: 12 }}>
+          <div className="flex gap-2 items-start text-xs" style={{ color: C.mute }}>
+            <AlertTriangle size={14} style={{ color: C.zhu, flexShrink: 0, marginTop: 2 }} />
+            <div>
+              <div style={{ color: C.text }}>本界面不做判定。</div>
+              早先的版本在 JS 裡重寫了一遍確定性層，又用模型做人物歸一，於是同一份
+              材料會從命令列和界面得到兩種結論，而使用者無從察覺哪個對。現在判定只有
+              一處（Python），模型也不再參與歸一 —— 歸一改由
+              <code> aliases.json </code>人工確認。
             </div>
-          ))}
-        </div>
+          </div>
+        </Panel>
 
-        <div className="flex flex-wrap items-center gap-3 mb-5">
-          <button onClick={run} disabled={busy} style={{ background: busy ? C.line : C.zhu, color: "#fff" }}
-            className="rounded px-4 py-2 text-sm flex items-center gap-2 disabled:opacity-60">
-            <Play size={14} />{busy ? "處理中" : "開始比對"}
-          </button>
-          <button onClick={() => setSrcs(s => [...s, { id: Date.now(), name: "新史源", stance: "", text: "" }])}
-            style={{ color: C.qing, border: `1px solid ${C.line}` }} className="rounded px-3 py-2 text-xs flex items-center gap-2">
-            <Plus size={13} />加一部書
-          </button>
-          <label style={{ color: C.mute }} className="text-xs flex items-center gap-2">分段字數
-            <input type="number" value={size} min={200} max={1500} onChange={e => setSize(+e.target.value)}
-              style={{ background: C.panel, color: C.text, border: `1px solid ${C.line}` }}
-              className="w-20 rounded px-2 py-1 outline-none" /></label>
-          {res && <button onClick={exportJSON} style={{ color: C.mute, border: `1px solid ${C.line}` }}
-            className="rounded px-3 py-2 text-xs flex items-center gap-2 ml-auto"><Download size={13} />匯出標註</button>}
-          {prog && <span style={{ color: C.qing }} className="text-xs">{prog}</span>}
-        </div>
-
-        {err && <div style={{ background: C.panel, borderLeft: `3px solid ${C.zhu}` }} className="rounded p-3 text-sm mb-4">{err}</div>}
-
-        {res && (
-          <>
-            <div className="flex flex-wrap gap-4 mb-4 text-xs">
-              <span style={{ color: C.mute }} className="flex items-center gap-1"><Users size={13} />{res.length} 人</span>
-              <span style={{ color: drop ? C.zhu : C.mute }} className="flex items-center gap-1">
-                <ShieldCheck size={13} />攔下 {drop} 條偽引</span>
-            </div>
-
-            {!res.length && (
-              <div style={{ background: C.panel, border: `1px dashed ${C.line}`, color: C.mute }}
-                className="rounded p-8 text-center text-sm">未見著錄。此段無可支撐的人物記載。</div>
+        <Panel style={{ marginBottom: 12 }}>
+          <div className="flex flex-wrap gap-3 items-center">
+            <label style={{ background: C.gold, color: C.ink }}
+              className="px-3 py-1 rounded text-xs flex gap-1 items-center cursor-pointer">
+              <Upload size={13} /> 載入檔案
+              <input type="file" accept=".json" className="hidden"
+                onChange={(e) => e.target.files?.[0] && load(e.target.files[0])} />
+            </label>
+            <span className="text-xs" style={{ color: C.mute }}>
+              <PenLine size={11} className="inline" /> 標注檔（<code>biaozhu.py sample</code> 產出）
+              或 <Eye size={11} className="inline" /> <code>findings.json</code>
+            </span>
+            {(doc || findings) && (
+              <button onClick={() => { setDoc(null); setFindings(null); }}
+                style={{ border: `1px solid ${C.line}`, color: C.mute }}
+                className="px-2 py-0.5 rounded text-xs">清空</button>
             )}
+          </div>
+          {err && <div className="text-xs mt-2" style={{ color: C.zhu }}>{err}</div>}
+        </Panel>
 
-            <div className="space-y-3">
-              {res.map(p => (
-                <div key={p.id} style={{ background: C.panel, border: `1px solid ${C.line}` }} className="rounded">
-                  <div className="flex flex-wrap items-center gap-3 px-4 py-3" style={{ borderBottom: `1px solid ${C.line}` }}>
-                    <span style={{ fontFamily: SERIF, color: C.paper }} className="text-lg">{p.id}</span>
-                    {p.aliases.length > 1 && <span style={{ color: C.mute }} className="text-xs">
-                      異稱：{p.aliases.filter(a => a !== p.id).join("、")}</span>}
-                    {p.stances.map(s => <span key={s} style={{ color: C.qing, border: `1px solid ${C.line}` }}
-                      className="text-xs rounded px-1.5 py-0.5">{s}</span>)}
-                    <div className="flex gap-1 ml-auto">
-                      {MARK.map(m => {
-                        const on = marks[p.id] === m.v;
-                        return <button key={m.v} onClick={() => setMarks(x => ({ ...x, [p.id]: on ? null : m.v }))}
-                          title={m.v} style={{ background: on ? m.c : "transparent", color: on ? "#fff" : C.mute, border: `1px solid ${C.line}` }}
-                          className="rounded px-2 py-1"><m.i size={12} /></button>;
-                      })}
-                    </div>
-                  </div>
+        {doc && <AnnotView doc={doc} setDoc={setDoc} />}
+        {findings && !doc && <FindingsView data={findings} />}
 
-                  {p.flags.length > 0 && (
-                    <div className="px-4 py-3 space-y-2" style={{ borderBottom: `1px solid ${C.line}` }}>
-                      {p.flags.map((f, i) => (
-                        <div key={i} className="flex gap-2 items-start">
-                          <AlertTriangle size={13} className="mt-0.5 shrink-0" style={{ color: f.w >= 4 ? C.zhu : C.mute }} />
-                          <div><span style={{ color: f.w >= 4 ? C.zhu : C.text }} className="text-xs">{f.k}</span>
-                            <span style={{ color: C.mute }} className="text-xs ml-2">{f.why}</span></div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  <div className="px-4 py-3 space-y-2">
-                    {p.hits.map((h, i) => (
-                      <div key={i} className="flex gap-3">
-                        <div className="shrink-0 w-28 pt-1">
-                          <div style={{ color: C.qing }} className="text-xs truncate">{h.src}·{h.chunk}</div>
-                          <div style={{ color: C.mute }} className="text-xs truncate">
-                            {[h.title, h.time].filter(Boolean).join(" ") || "—"}</div>
-                        </div>
-                        <div className="flex-1">
-                          <p style={{ background: C.paper, color: "#1A1A1A", fontFamily: SERIF, lineHeight: 1.9 }}
-                            className="text-sm rounded px-3 py-2">{h.evidence}</p>
-                          {h.acts?.length > 0 && <div className="flex flex-wrap gap-1 mt-1">
-                            {h.acts.map(a => <span key={a} style={{ color: C.mute, border: `1px solid ${C.line}` }}
-                              className="text-xs rounded px-1.5">{a}</span>)}</div>}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
+        {!doc && !findings && (
+          <Panel>
+            <div className="text-xs leading-relaxed" style={{ color: C.mute }}>
+              <div style={{ color: C.text }} className="mb-2">怎麼用</div>
+              <div>1. <code>python huijian.py verify work/</code> —— 產出 findings.json</div>
+              <div>2. <code>python biaozhu.py sample work/ -n 150</code> —— 產出標注檔</div>
+              <div>3. 在此載入標注檔，逐條判斷，匯出</div>
+              <div>4. <code>python biaozhu.py score work/ --name annot_judged.json</code></div>
+              <div className="mt-2">兩人各標一份，<code>--second</code> 可算 Cohen's κ。流程見 docs/05。</div>
             </div>
-          </>
+          </Panel>
         )}
+
+        <div className="text-xs mt-6 flex gap-4 flex-wrap" style={{ color: C.line }}>
+          <span><Check size={11} className="inline" style={{ color: C.qing }} /> 肯定</span>
+          <span><HelpCircle size={11} className="inline" style={{ color: C.gold }} /> 保留／不適用</span>
+          <span><Ban size={11} className="inline" style={{ color: C.zhu }} /> 否定</span>
+        </div>
       </div>
     </div>
   );

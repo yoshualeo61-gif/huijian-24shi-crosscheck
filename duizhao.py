@@ -225,9 +225,22 @@ def anchors(row):
     }
 
 
+# 兩個紀年都已知、且相差超過這個年數，就判為兩件事，不再並置。
+YEAR_GAP_MAX = 2
+
+
 def pair_score(a, b):
-    """三重錨定。人物最重，紀年次之，地點再次。"""
+    """三重錨定。人物最重，紀年次之，地點再次。
+
+    已知而相衝的紀年是**否證**，不只是「不加分」。實測教訓：
+    徐玄明殺張稷（513）曾與郁洲獻白鹿（475）配成一組 —— 相隔三十八年,
+    只因同地點（＋2）又同月（＋2）剛好達到門檻 4，接著 diverge 還把
+    那三十八年的落差報成一條權重 5 的「紀年歧異」，湊成權重 9。
+    """
     s, why = 0, []
+    if (a["year"] and b["year"]
+            and abs(a["year"][0] - b["year"][0]) > YEAR_GAP_MAX):
+        return 0, []                     # 年代相去太遠，不是同一事
     if a["person"] and a["person"] == b["person"]:
         s += 3
         why.append(f"同人物 {a['person']}")
@@ -259,7 +272,12 @@ def pair_score(a, b):
 def diverge(ra, rb, aa, ab):
     """並置之後，分歧在哪。"""
     out = []
-    if aa["year"] and ab["year"] and aa["year"][0] != ab["year"][0]:
+    # 一方的紀年寫法是另一方的後綴（「二年二月」vs「延昌二年二月」）時,
+    # 那是檢索窗口截掉了年號，不是歧異。
+    ta_, tb_ = (ra.get("time") or ""), (rb.get("time") or "")
+    compatible = bool(ta_) and bool(tb_) and (ta_ in tb_ or tb_ in ta_)
+    if (aa["year"] and ab["year"] and aa["year"][0] != ab["year"][0]
+            and not compatible):
         why = (f"{ra['book']}作{aa['year'][1]}{aa['year'][2]}年"
                f"（{aa['year'][0]}）／{rb['book']}作{ab['year'][1]}{ab['year'][2]}年"
                f"（{ab['year'][0]}）")

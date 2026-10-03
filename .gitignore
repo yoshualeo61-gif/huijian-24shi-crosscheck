@@ -5,6 +5,7 @@ corpus/
 # 工作目錄與產出
 work/
 out/
+real/
 *_findings.json
 *_report.txt
 !samples/*_findings.json
