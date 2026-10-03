@@ -827,7 +827,9 @@ def cmd_verify(a):
                 why = ("引文跨越中略，疑為拼接"
                        if len(ev) >= 4 and ev in c.get("chunk", "")
                        else "引文不在原文")
-                dropped.append({**it, "why": why})
+                dropped.append({**it, "why": why,
+                                "chunk": c.get("chunk", ""),
+                                "book": c.get("book"), "juan": c.get("juan")})
                 continue
             rows.append({**it, "evidence": ev, "book": c["book"],
                          "juan": c["juan"], "stance": c["stance"],
@@ -905,6 +907,9 @@ def cmd_verify(a):
                     + f"知異索引 {len(zy)} 條，本次無一命中 —— "
                       f"或確屬未論及，或索引覆蓋不足，兩者無法由此分辨。")
     _dump(w / "findings.json", res)
+    # 攔截紀錄要存下來：攔截率是模型質量的在線指標，但「攔得對不對」
+    # 本身沒被量過。存檔才能當負對照標注（biaozhu.py 的 C 軌）。
+    _dump(w / "dropped.json", dropped)
     if dropped:
         print(f"攔下 {len(dropped)} 條偽引：", file=sys.stderr)
         for d in dropped[:10]:

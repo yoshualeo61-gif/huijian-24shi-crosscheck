@@ -6,10 +6,10 @@
     python tests/test_fixes.py
 """
 
-import os, pathlib, shutil, sys, tempfile
+import collections, json, os, pathlib, shutil, sys, tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-import huijian, duizhao
+import huijian, duizhao, biaozhu
 
 FAIL = []
 
@@ -397,6 +397,126 @@ def test_permutation_is_sensitive():
           "檢驗確實對立場結構敏感（否則 p 值毫無意義）")
 
 
+# ── 13. 統計：區間與 κ 必須算對，整個標注環節的結論都靠它 ──────
+def test_wilson_interval():
+    print("13. Wilson 區間")
+    lo, hi = biaozhu.wilson(9, 10)
+    check(0.55 < lo < 0.60 and 0.97 < hi <= 1.0,
+          "9/10 → 約 [0.56, 0.98]", f"[{lo:.3f}, {hi:.3f}]")
+    lo, hi = biaozhu.wilson(135, 150)
+    check(0.84 < lo < 0.86 and 0.93 < hi < 0.95,
+          "135/150 → 約 [0.85, 0.94]", f"[{lo:.3f}, {hi:.3f}]")
+    lo, hi = biaozhu.wilson(0, 10)
+    check(lo == 0.0 and 0.25 < hi < 0.35, "k=0 不退化成 [0,0]",
+          f"[{lo:.3f}, {hi:.3f}]")
+    lo, hi = biaozhu.wilson(10, 10)
+    check(hi == 1.0 and 0.65 < lo < 0.75, "k=n 不退化成 [1,1]",
+          f"[{lo:.3f}, {hi:.3f}]")
+    lo, hi = biaozhu.wilson(0, 0)
+    check((lo, hi) == (0.0, 1.0), "n=0 回傳全區間")
+    # 樣本量越大區間越窄 —— 這是建議 n=150 的根據
+    w30 = biaozhu.wilson(27, 30)
+    w150 = biaozhu.wilson(135, 150)
+    check((w150[1] - w150[0]) < (w30[1] - w30[0]),
+          "n 越大區間越窄", f"{w30} vs {w150}")
+
+
+def test_kappa():
+    print("13b. Cohen's κ")
+    check(biaozhu.kappa([("ok", "ok"), ("wrong", "wrong")] * 5) == 1.0,
+          "完全一致 → κ=1")
+    k = biaozhu.kappa([("ok", "wrong"), ("wrong", "ok")] * 5)
+    check(k is not None and k < 0, "系統性相反 → κ<0", str(k))
+    # 兩人都只用一個類別：po=1 但 pe=1，κ 無定義（不可報成 1.0）
+    check(biaozhu.kappa([("ok", "ok")] * 10) is None,
+          "僅用單一類別 → None，不冒充完美一致")
+    check(biaozhu.kappa([]) is None, "空輸入 → None")
+    # 期望值在測試裡獨立算一遍，不靠寫測試時的心算
+    pairs = ([("a", "a")] * 5 + [("b", "b")] * 2
+             + [("a", "b")] * 2 + [("b", "a")] * 1)
+    n = len(pairs)
+    po = sum(1 for x, y in pairs if x == y) / n
+    pa = {c: sum(1 for x, _ in pairs if x == c) / n for c in "ab"}
+    pb = {c: sum(1 for _, y in pairs if y == c) / n for c in "ab"}
+    pe = sum(pa[c] * pb[c] for c in "ab")
+    want = (po - pe) / (1 - pe)
+    k = biaozhu.kappa(pairs)
+    check(abs(k - want) < 1e-12,
+          f"與獨立算出的 κ={want:.4f} 相符", f"got {k:.4f}")
+    check(abs(want - 0.3478) < 1e-3, "該例的 κ 約為 0.348", f"{want:.4f}")
+
+
+def test_stratified_sampling():
+    print("13c. 分層抽樣")
+    pool = ([{"g": "多", "i": i} for i in range(90)]
+            + [{"g": "少", "i": i} for i in range(10)])
+    pick = biaozhu.stratified(pool, 20, lambda x: x["g"], seed=0)
+    check(len(pick) == 20, "抽到 20 條", str(len(pick)))
+    gs = collections.Counter(x["g"] for x in pick)
+    check(gs["少"] >= 1, "罕見層沒被抽空（純隨機很可能一條不中）", str(dict(gs)))
+    check(abs(gs["多"] - 18) <= 1 and abs(gs["少"] - 2) <= 1,
+          "按比例分配 18/2", str(dict(gs)))
+    # 同種子可復現，不同種子會換樣本
+    again = biaozhu.stratified(pool, 20, lambda x: x["g"], seed=0)
+    check([x["i"] for x in pick] == [x["i"] for x in again], "同種子可復現")
+    other = biaozhu.stratified(pool, 20, lambda x: x["g"], seed=7)
+    check([x["i"] for x in pick] != [x["i"] for x in other], "不同種子換樣本")
+    check(len(biaozhu.stratified(pool, 500, lambda x: x["g"])) == 100,
+          "n 大於總量時全取")
+
+
+def test_annotation_values_are_validated():
+    print("13d. 標注值校驗")
+    good = [{"id": "A0001", "track": "A",
+             "verdict": {"person": "ok", "overall": "ok"}}]
+    check(biaozhu._check(good) == [], "合法值通過")
+    typo = [{"id": "A0002", "track": "A",
+             "verdict": {"person": "OK", "overall": "ok"}}]
+    bad = biaozhu._check(typo)
+    check(len(bad) == 1 and "A0002" in bad[0],
+          "拼錯的值被指出，而不是悄悄略過（否則分母會無聲縮水）", str(bad))
+    partial = [{"id": "A0003", "track": "A",
+                "verdict": {"person": None, "overall": None}}]
+    check(biaozhu._check(partial) == [], "未標注（null）不算錯")
+
+
+def test_rate_excludes_na():
+    print("13e. 計分：na 不計入分母")
+    items = [
+        {"id": "A1", "track": "A", "verdict": {"place": "na"}},
+        {"id": "A2", "track": "A", "verdict": {"place": "ok"}},
+        {"id": "A3", "track": "A", "verdict": {"place": "wrong"}},
+        {"id": "A4", "track": "A", "verdict": {"place": None}},
+    ]
+    r = biaozhu._rate(items, "A", "place", {"ok"})
+    check(r["n"] == 2 and r["k"] == 1,
+          "na 與未標注都不入分母 → 1/2", str(r))
+    check(biaozhu._rate(items, "A", "time", {"ok"}) is None,
+          "全未標注 → None，不報 0%")
+
+
+def test_sample_judges_extracted_name():
+    print("13f. A 軌判原始抽取的人名，不判歸一後的")
+    w = pathlib.Path(tempfile.mkdtemp())
+    try:
+        findings = [{"person": "劉善明", "stances": ["南朝系"], "acts": ["筑城"],
+                     "flags": [[3, "僅見於「南朝系」", "理由"]],
+                     "hits": [{"person": "劉善明", "person_raw": "善明",
+                               "book": "宋书", "juan": "一", "stance": "南朝系",
+                               "acts": ["筑城"], "time": "", "place": "",
+                               "evidence": "善明築城"}],
+                     "score": 3}]
+        json.dump(findings, open(w / "findings.json", "w", encoding="utf-8"),
+                  ensure_ascii=False)
+        items = biaozhu.build_sample(w, 10, 10, 10, 0, huijian.TERMINAL)
+    finally:
+        shutil.rmtree(w, ignore_errors=True)
+    a = [i for i in items if i["track"] == "A"][0]
+    check(a["person"] == "善明", "待判的是抽取原形「善明」", a["person"])
+    check(a["person_normalized"] == "劉善明", "歸一後的形另存，供參考",
+          a["person_normalized"])
+
+
 if __name__ == "__main__":
     for t in (test_scan_keeps_parallel_passages,
               test_scan_still_folds_duplicates_within_a_book,
@@ -411,7 +531,13 @@ if __name__ == "__main__":
               test_baseline_downweights_silence,
               test_terminal_rate_counts,
               test_flag_kind_strips_stance,
-              test_permutation_is_sensitive):
+              test_permutation_is_sensitive,
+              test_wilson_interval,
+              test_kappa,
+              test_stratified_sampling,
+              test_annotation_values_are_validated,
+              test_rate_excludes_na,
+              test_sample_judges_extracted_name):
         t()
         print()
     if FAIL:
