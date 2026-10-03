@@ -28,18 +28,51 @@ COR = pathlib.Path("corpus")
 MODEL = "claude-sonnet-4-6"
 
 # ── 立場表：決定「單方獨載」怎麼算 ────────────────────────────
-STANCE = {
-    "宋书": "南朝系", "南齐书": "南朝系", "梁书": "南朝系", "陈书": "南朝系",
-    "魏书": "北朝系", "北齐书": "北朝系", "周书": "北朝系",
-    # 《南史》《北史》為李延壽唐修，係刪削《宋書》《南齊書》《魏書》等而成。
-    # 計入南／北朝系會把派生本當成獨立證人，虛增立場軸的獨立性，
-    # 獨載檢測與跨立場對齊都會因此失真。
-    "南史": "唐修", "北史": "唐修", "晋书": "唐修", "隋书": "唐修",
-    "旧唐书": "五代宋修", "新唐书": "五代宋修",
-    "旧五代史": "宋修", "新五代史": "宋修", "宋史": "元修",
-    "辽史": "元修", "金史": "元修", "元史": "明修", "明史": "清修",
+# ── 兩條立場軸 ────────────────────────────────────────────
+# v0.2.6 之前只有一條 `STANCE`，把兩件不同的事混在一起：
+# **誰修的**，和**替誰說話**。南北朝兩者恰好重合（《宋書》南齊修、
+# 記劉宋、依南朝實錄），所以看不出問題。元修三史一下就暴露了：
+# 《宋史》《遼史》《金史》同為元修，舊版歸作同一立場「元修」，
+# 而 `align()` 只比對不同立場 —— 於是宋、遼、金這組二十四史裡最富的
+# 對照，本工具**從結構上碰不到**。舊唐書／新唐書、舊五代史／新五代史
+# 同病。這不是覆蓋不足，是分類錯誤。
+#
+# COMPILER 誰修的。用於源流判斷，以及「同一批人修的書，其互相一致
+#          不如各自獨立成書者有力」。
+# CAMP     替哪個政權說話、依誰的實錄。**跨立場比對用這一條。**
+COMPILER = {
     "史记": "漢修", "汉书": "漢修", "后汉书": "南朝修", "三国志": "晋修",
+    "宋书": "南朝修", "南齐书": "南朝修",
+    "梁书": "唐修", "陈书": "唐修", "魏书": "北朝修",
+    "北齐书": "唐修", "周书": "唐修",
+    "南史": "唐修", "北史": "唐修", "晋书": "唐修", "隋书": "唐修",
+    "旧唐书": "五代修", "新唐书": "宋修",
+    "旧五代史": "宋修", "新五代史": "宋修",
+    "宋史": "元修", "辽史": "元修", "金史": "元修",
+    "元史": "明修", "明史": "清修",
 }
+
+# 替哪個政權說話。同一時期而不同陣營的書，才值得並置。
+# 《三國志》的魏、蜀、吳同在一書，書內對立本工具不處理（見 docs/06）。
+CAMP = {
+    "史记": "漢系", "汉书": "漢系", "后汉书": "漢系",
+    "三国志": "三國",
+    "晋书": "晉系",
+    "宋书": "南朝系", "南齐书": "南朝系", "梁书": "南朝系",
+    "陈书": "南朝系", "南史": "南朝系",
+    "魏书": "北朝系", "北齐书": "北朝系", "周书": "北朝系",
+    "北史": "北朝系",
+    "隋书": "隋系",
+    "旧唐书": "唐系", "新唐书": "唐系",
+    "旧五代史": "五代系", "新五代史": "五代系",
+    "宋史": "宋系", "辽史": "遼系", "金史": "金系",
+    "元史": "元系", "明史": "明系",
+}
+
+# 管線一路傳的 `stance` 指的是「替誰說話」那一條。
+# 《南史》《北史》的非獨立性現在由 DERIVED_FROM 直接表達,
+# 不再借立場標籤充當代理（v0.2.1 當初是這麼權宜的）。
+STANCE = CAMP
 
 # ── 各書的紀事起訖（公元）────────────────────────────────
 # 兩個用處：年號消歧（《泰始二年》在《晉書》是 266、在《宋書》是 466）,
@@ -104,9 +137,14 @@ def independent_witnesses(books):
 
 # ── 行為類型與互斥規則（確定性層）────────────────────────────
 ACTS = ["除授", "罢黜", "赴任", "征战", "战胜", "战败", "死于战", "病卒",
-        "被杀", "归降", "被俘", "叛乱", "筑城", "赈济", "上书", "出使",
-        "逃亡", "受封赏"]
-TERMINAL = {"死于战", "病卒", "被杀", "归降", "被俘"}   # 任兩者並存＝硬矛盾
+        "被杀", "自杀", "归降", "被俘", "叛乱", "筑城", "赈济", "上书",
+        "出使", "逃亡", "受封赏"]
+# 「自杀」是補的第 19 類。孫恩的結局是「乃赴海自沈」，舊表裡沒有一類
+# 裝得下它，於是本案例裡反覆出現的這個人物，其終局根本無法編碼,
+# 終局互斥與終局獨載對他一概失效（docs/06 記了很久的缺口）。
+# 賜死、自縊、憂死同歸此類 —— 它們在政治上與「被殺」往往只隔一道詔書,
+# 兩書各記其一正是考異的入口。
+TERMINAL = {"死于战", "病卒", "被杀", "自杀", "归降", "被俘"}  # 兩者並存＝硬矛盾
 PAIRS = [("战胜", "战败")]
 
 # 故意留的錯誤規則。一個人先任後免是正常序列，這條必然誤報。
@@ -123,6 +161,8 @@ TERMINAL_LEX = [
     "坐誅", "坐诛", "梟首", "枭首", "斬之", "斩之", "遇害",   # 被殺
     "戰死", "战死", "沒於陣", "没于阵", "力戰而死", "力战而死",  # 死於戰
     "被擒", "見擒", "见擒", "為所執", "为所执",              # 被俘
+    "自殺", "自杀", "自縊", "自缢", "自沈", "自沉", "伏劍", "伏剑",
+    "憂死", "忧死", "飲藥", "饮药", "赴海", "投水",          # 自殺
     "內附", "内附", "歸降", "归降", "來降", "来降",
     "舉城降", "举城降",                                     # 歸降
 ]
@@ -1289,10 +1329,120 @@ def cmd_verify(a):
     print(f"\n→ {w}/findings.json　{w}/report.txt", file=sys.stderr)
 
 
+# ── 覆蓋報告：在你的時代，本工具能做什麼 ────────────────────
+# 「是不是通用工具」不能靠宣稱，得逐書數出來。人物層要靠列傳：
+# 某書只有本紀，它就進不了跨陣營的人物比對 —— 郁洲案例的基線在
+# 南朝系各書上無法成立，根子就在這裡（docs/06）。
+BIO_MARKS = ("列传", "列傳", "传", "傳", "世家")
+
+
+def juan_kinds(book):
+    """某書各門類的卷數。檔名形如「列传_卷三十五」。"""
+    out = collections.Counter()
+    d = COR / book
+    if not d.exists():
+        return out
+    for f in d.glob("*.txt"):
+        m = re.match(r"([^_]+)_", f.stem)
+        out[m.group(1) if m else "未分"] += 1
+    return out
+
+
+def bio_juan(kinds):
+    """其中有多少卷算得上列傳。整書未分門類者無從判斷，回傳 None。"""
+    if not kinds:
+        return 0
+    if all(k.startswith("原文版") or k == "未分" for k in kinds):
+        return None                      # 未分門類，數不出來
+    return sum(n for k, n in kinds.items() if any(w in k for w in BIO_MARKS))
+
+
+def coverage():
+    """逐書算出：門類、列傳卷數、年號數、陣營、對手。"""
+    import duizhao                        # 延後匯入：duizhao 匯入本模組
+    rows = []
+    for book in sorted(BOOK_SPAN, key=lambda b: BOOK_SPAN[b][0]):
+        kinds = juan_kinds(book)
+        lo, hi = BOOK_SPAN[book]
+        rows.append({
+            "book": book,
+            "juan": sum(kinds.values()),
+            "bio": bio_juan(kinds),
+            "camp": CAMP.get(book, "?"),
+            "compiler": COMPILER.get(book, "?"),
+            "span": (lo, hi),
+            "eras": sum(1 for _, y, _ in duizhao.ERAS if lo <= y <= hi),
+            "derived": sorted(DERIVED_FROM.get(book, ())),
+        })
+    # 對手：斷代重疊、陣營不同、且本身有列傳可比的書
+    present = {r["book"]: r for r in rows if r["juan"]}
+    for r in rows:
+        lo, hi = r["span"]
+        r["rivals"] = sorted({
+            o["camp"] for o in present.values()
+            if o["camp"] != r["camp"]
+            and o["span"][0] <= hi and lo <= o["span"][1]
+            and (o["bio"] is None or o["bio"] > 0)
+            and not derivation(r["book"], o["book"])})
+    return rows
+
+
+def cmd_cover(a):
+    rows = coverage()
+    print(f"{'書':8s}{'卷':>5s}{'列傳':>5s}{'年號':>5s}  "
+          f"{'陣營':6s}{'編纂':6s}{'起訖':>12s}  可比陣營")
+    print("─" * 92)
+    for r in rows:
+        if not r["juan"] and not a.all:
+            continue
+        bio = "未分" if r["bio"] is None else str(r["bio"])
+        lo, hi = r["span"]
+        src = f"（刪削自《{'》《'.join(r['derived'])}》）" if r["derived"] else ""
+        print(f"{r['book']:8s}{r['juan']:>5d}{bio:>5s}{r['eras']:>5d}  "
+              f"{r['camp']:6s}{r['compiler']:6s}{lo:>6d}–{hi:<5d} "
+              f"{'、'.join(r['rivals']) or '—'}{src}")
+
+    print("\n── 哪個時代真做得動 ──")
+    print("人物層的跨陣營比對要三件事同時成立：兩個陣營、斷代重疊、"
+          "兩邊都有列傳。")
+    # 逐**陣營**判一次，不是逐書：同一陣營裡《魏書》有 92 卷列傳而
+    # 《北齊書》一卷都數不出來，逐書判會把北朝系同時列進「做得動」
+    # 和「太薄」兩欄。
+    bycamp, rivals = collections.defaultdict(list), collections.defaultdict(set)
+    for r in rows:
+        if r["juan"]:
+            bycamp[r["camp"]].append(r)
+            rivals[r["camp"]] |= set(r["rivals"])
+    bio = {c: sum(x["bio"] or 0 for x in v) for c, v in bycamp.items()}
+    ok, weak = [], []
+    for c, v in bycamp.items():
+        if not rivals[c]:
+            continue
+        best = max((bio.get(o, 0) for o in rivals[c]), default=0)
+        who = max(rivals[c], key=lambda o: bio.get(o, 0))
+        (ok if bio[c] >= 20 and best >= 20 else weak).append(
+            (c, bio[c], who, best))
+    for c, m, who, o in sorted(ok, key=lambda x: -min(x[1], x[3])):
+        print(f"  ✓ {c:6s} 列傳 {m:4d} 卷，對手「{who}」{o:4d} 卷")
+    for c, m, who, o in sorted(weak, key=lambda x: min(x[1], x[3])):
+        lack = "本陣營" if m < 20 else f"對手「{who}」"
+        print(f"  · {c:6s} 列傳 {m:4d}／對手「{who}」{o:4d} —— "
+              f"{lack}樣本太薄，只能當索引用")
+    print("\n註一：列傳「未分」者（檔名作「原文版…」）無從按檔名判斷門類，"
+          "小結裡按 0 計 —— 保守，寧可低報。")
+    print("      本語料恰好相符：《梁書》《南史》在此只有本紀，"
+          "傳主 harvest 實測得 0 與 2 人（docs/06）。")
+    print("註二：年號數為元年落在該書起訖之內者。0 表示該書的紀年"
+          "一律換算不出，則錨定少 3 分、紀年歧異永不觸發。")
+
+
 def main():
     ap = argparse.ArgumentParser(description="互見 — 二十四史交叉比對")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("fetch", help="下載並轉換語料").set_defaults(fn=cmd_fetch)
+    c = sub.add_parser("cover", help="逐書逐期說明本工具能做什麼")
+    c.add_argument("--all", action="store_true", help="連語料裡沒有的書也列出")
+    c.set_defaults(fn=cmd_cover)
     for name, fn, extra in [("search", cmd_search, False),
                             ("dossier", cmd_dossier, True),
                             ("chunks", cmd_chunks, True),

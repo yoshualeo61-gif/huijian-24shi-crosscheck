@@ -119,13 +119,27 @@ def test_no_phantom_year_anchor():
 
 # ── 4. 《南史》《北史》為唐修，非南北朝當代證人 ────────────
 def test_stance_of_derivative_histories():
-    print("4. 立場表：派生本不計入南北朝系")
-    check(huijian.STANCE["南史"] == "唐修", "南史 → 唐修",
-          huijian.STANCE["南史"])
-    check(huijian.STANCE["北史"] == "唐修", "北史 → 唐修",
-          huijian.STANCE["北史"])
-    check(huijian.STANCE["宋书"] == "南朝系", "宋书 仍為南朝系")
-    check(huijian.STANCE["魏书"] == "北朝系", "魏书 仍為北朝系")
+    print("4. 兩條立場軸：誰修的、替誰說話")
+    # 《南史》是唐修（編纂），但它替南朝說話（陣營）。舊版用一個標籤
+    # 兼表兩義，於是只能二選一；非獨立性現在由 DERIVED_FROM 直接表達。
+    check(huijian.COMPILER["南史"] == "唐修", "南史 編纂 → 唐修",
+          huijian.COMPILER["南史"])
+    check(huijian.CAMP["南史"] == "南朝系", "南史 陣營 → 南朝系",
+          huijian.CAMP["南史"])
+    check(huijian.derivation("南史", "宋书") is not None,
+          "其非獨立性由源流表表達，不靠立場標籤")
+    check(huijian.CAMP["宋书"] == "南朝系", "宋书 仍為南朝系")
+    check(huijian.CAMP["魏书"] == "北朝系", "魏书 仍為北朝系")
+    check(huijian.STANCE is huijian.CAMP, "管線傳的 stance 即陣營那條")
+    # 元修三史：同一批人修的，卻替三個敵對政權說話 —— 舊版歸作同一
+    # 立場「元修」，align 於是永不比對，宋遼金從結構上碰不到。
+    check(huijian.COMPILER["宋史"] == huijian.COMPILER["辽史"] == "元修",
+          "宋史、辽史 同為元修")
+    check(huijian.CAMP["宋史"] != huijian.CAMP["辽史"],
+          "但陣營不同，可以並置",
+          f"{huijian.CAMP['宋史']} vs {huijian.CAMP['辽史']}")
+    check(len({huijian.CAMP[b] for b in ("宋史", "辽史", "金史")}) == 3,
+          "宋、遼、金三個陣營各自分開")
 
 
 # ── 5. 逐字校驗閘仍攔得住杜撰與改寫 ────────────────────────
@@ -826,8 +840,9 @@ def test_sole_record_flag_downweighted():
         {"person": "丙", "acts": ["赴任"], "time": "", "evidence": "丙至郡",
          "book": "魏书", "juan": "二", "stance": "北朝系"},
     ]
+    # 第三個陣營得與斷代重疊，否則會被 _relevant_stances 正確篩掉。
     r = huijian.analyse([dict(x) for x in rows],
-                        ["南朝系", "北朝系", "唐修"])
+                        ["南朝系", "北朝系", "晉系"])
     f = [(w, y) for p in r for w, k, y in p["flags"] if "僅見於" in k]
     check(f and f[0][0] == 1, f"權重 1（原為 3）", str(f[0][0] if f else None))
     check(f and "這不是立場證據" in f[0][1], "報告裡直說它不是立場證據")
@@ -879,11 +894,11 @@ def test_single_witness_is_not_a_signal():
     check(r[0]["score"] == 0, "權重 0，不進排序", str(r[0]["score"]))
     # 兩個獨立史源時才留給「僅見於」去判
     # 第三個立場得與斷代重疊，否則會被 _relevant_stances 正確篩掉
-    # （「元修」是《宋史》960–1279，對梁魏兩書毫不相干）。
+    # （「元系」是《宋史》960–1279，對梁魏兩書毫不相干）。
     two = one + [{"person": "庚", "acts": ["赴任"], "time": "",
                   "evidence": "庚至郡", "book": "魏书", "juan": "二",
                   "stance": "北朝系"}]
-    ks2 = [k for p in huijian.analyse(two, ["南朝系", "北朝系", "唐修"])
+    ks2 = [k for p in huijian.analyse(two, ["南朝系", "北朝系", "晉系"])
            for _, k, _ in p["flags"]]
     check(any("僅見於" in k for k in ks2), "兩個獨立史源時照報", str(ks2))
 
@@ -899,6 +914,158 @@ def test_offperiod_books_excluded():
     # 語料裡沒有 BOOK_SPAN 的書時，不做篩選，寧可多報不可漏報
     check(huijian._relevant_stances({"無此書"}, ["甲", "乙"]) == ["甲", "乙"],
           "無斷代資料時不篩")
+
+
+# ── 16. 不只一個時代：兩條軸、年號表、斷代 ───────────────────
+def test_rival_camps_same_compiler():
+    print("16. 同修而敵對的三部書必須比對得到")
+    # 《宋史》《遼史》《金史》同為元修。舊版一條 STANCE 把它們歸作
+    # 同一立場「元修」，而 align 只比對不同立場 —— 於是宋遼金這組
+    # 二十四史裡最富的對照，本工具**從結構上碰不到**。
+    a = {"person": "曹利用", "place": "澶州", "time": "景德元年",
+         "acts": ["出使"], "evidence": "遣曹利用使于契丹，議和",
+         "book": "宋史", "juan": "本紀七", "stance": huijian.CAMP["宋史"]}
+    b = {"person": "曹利用", "place": "澶州", "time": "統和二十二年",
+         "acts": ["出使"], "evidence": "宋遣曹利用來納款，許之",
+         "book": "辽史", "juan": "本紀十四", "stance": huijian.CAMP["辽史"]}
+    g = duizhao.align([a, b])
+    check(len(g) == 1, "並置得到（舊版為 0 組）", str(len(g)))
+    p = g[0]
+    check(any("同年 1004" in w for w in p["anchors"]),
+          "兩套紀年都換算出 1004，同年錨定成立", str(p["anchors"]))
+    ks = [k for _, k, _ in p["diverge"]]
+    check("立場用語對立" in ks, "《宋史》議和／《遼史》納款 → 立場用語對立",
+          str(ks))
+    check(any("同修" in k for k in ks),
+          "同時標出同為元修、互證力較弱", str(ks))
+
+
+def test_span_overlap_blocks_absurd_pairs():
+    print("16b. 斷代不重疊的兩部書不得並置")
+    check(duizhao.span_overlap("三国志", "明史") is False,
+          "《三國志》184–280 與《明史》1368–1644 無交集")
+    check(duizhao.span_overlap("宋史", "辽史") is True, "宋遼重疊")
+    check(duizhao.span_overlap("宋史", "無此書") is True,
+          "無斷代資料時不排除，寧可多報")
+    a = {"person": "王某", "place": "幽州", "time": "", "acts": ["征战"],
+         "evidence": "王某攻幽州", "book": "三国志", "juan": "一",
+         "stance": huijian.CAMP["三国志"]}
+    b = dict(a, book="明史", juan="二", stance=huijian.CAMP["明史"],
+             evidence="王某克幽州")
+    check(duizhao.align([a, b]) == [], "相隔千年，不產出對照組")
+
+
+def test_eras_cover_through_ming():
+    print("16c. 年號表覆蓋到明末")
+    # 舊表 71 條裡 56 條是南北朝的，581 年以後一個都沒有 —— 於是
+    # 《隋書》以降十部書的紀年層全是死的。
+    cases = [("大业七年", "隋书", 611), ("開元十三年", "旧唐书", 725),
+             ("顯德元年", "旧五代史", 954), ("統和二十二年", "辽史", 1004),
+             ("景德元年", "宋史", 1004), ("泰和八年", "金史", 1208),
+             ("至正十一年", "元史", 1351), ("洪武三十一年", "明史", 1398)]
+    for t, b, exp in cases:
+        r = duizhao.to_year(t, b)
+        check(r is not None and r[0] == exp, f"{t}（{b}）→ {exp}",
+              str(r))
+    n = sum(1 for _, y, _ in duizhao.ERAS if y >= 581)
+    check(n > 200, f"581 年以後有 {n} 條（舊表 0 條）")
+
+
+def test_era_collision_across_dynasties():
+    print("16d. 跨朝同名年號：靠書名消歧，定不下來就不猜")
+    # 「貞元」唐德宗 785、金海陵王 1153，相差三百六十八年。
+    check(duizhao.to_year("貞元元年", "旧唐书")[0] == 785, "唐 → 785")
+    check(duizhao.to_year("贞元元年", "金史")[0] == 1153, "金 → 1153")
+    check(duizhao.to_year("貞元元年") is None, "無書名可據時不猜")
+    # 「至德」陳後主 583、唐肅宗 756 —— 鏈式核對抓出來的漏收
+    check(duizhao.to_year("至德元年", "陈书")[0] == 583, "陳 → 583")
+    check(duizhao.to_year("至德元年", "旧唐书")[0] == 756, "唐 → 756")
+    # 「元光」漢武帝 -134、金宣宗 1222
+    check(duizhao.to_year("元光元年", "汉书")[0] == -134, "西漢 → -134")
+    check(duizhao.to_year("元光元年", "金史")[0] == 1222, "金 → 1222")
+
+
+def test_era_table_dynasty_consistency():
+    print("16e. 年號表的元年須與所標朝代相合")
+    # checkeras 的第一道核對，離線版：不碰語料，只核表內自洽。
+    bad = [(e, y, d) for e, y, d in duizhao.ERAS
+           if d in duizhao.DYNASTY_SPAN
+           and not (duizhao.DYNASTY_SPAN[d][0] - 30 <= y
+                    <= duizhao.DYNASTY_SPAN[d][1] + 30)]
+    check(not bad, f"{len(duizhao.ERAS)} 條全部相合", str(bad[:5]))
+    check(len(duizhao.DYNASTY_SPAN) >= 20, "朝代表涵蓋二十朝以上")
+
+
+def test_era_usage_substring_guard():
+    print("16f. 短年號不得吃掉長年號的年次")
+    # 「大通五年」在真語料裡三處全是「中大通五年」的一部分。照收會把
+    # 梁武帝大通算成五年，於是鏈式核對誤報「中大通」的元年。
+    text = {"梁书": "梁中大通五年春，又中大通五年冬，再中大通五年。"}
+    mx, books = duizhao.era_usage(text, "大通")
+    check(mx is None, "「大通」在這段裡一次都不算", str(mx))
+    mx2, _ = duizhao.era_usage(text, "中大通")
+    check(mx2 == 5, "「中大通」算得到五年", str(mx2))
+
+
+def test_era_usage_ignores_lone_outlier():
+    print("16g. 孤例不算年號長度")
+    # 《宋史》律曆志「苟以天道時刻預定乾道十二年」—— 那個「乾道」是
+    # 易義的天道，不是孝宗年號（乾道只有九年）。
+    text = {"宋史": "乾道元年。乾道元年。乾道九年。乾道九年。乾道十二年。"}
+    mx, _ = duizhao.era_usage(text, "乾道")
+    check(mx == 9, "只採出現兩次以上的最大年次", str(mx))
+
+
+def test_suicide_is_an_act():
+    print("16h. 自殺進得了行為類型表")
+    # 孫恩的結局是「乃赴海自沈」。舊表十八類裡沒有一類裝得下它，
+    # 於是本案例裡反覆出現的這個人物，終局根本無法編碼。
+    check("自杀" in huijian.ACTS, "ACTS 收了自杀")
+    check("自杀" in huijian.TERMINAL, "且算終局，可觸發終局互斥／獨載")
+    rows = [
+        {"person": "孫恩", "acts": ["自杀"], "time": "", "evidence": "乃赴海自沈",
+         "book": "晋书", "juan": "一", "stance": huijian.CAMP["晋书"]},
+        {"person": "孫恩", "acts": ["被杀"], "time": "", "evidence": "恩為所殺",
+         "book": "宋书", "juan": "二", "stance": huijian.CAMP["宋书"]},
+    ]
+    ks = [k for p in huijian.analyse(rows, ["晉系", "南朝系"])
+          for _, k, _ in p["flags"]]
+    check(any("終局互斥" in k for k in ks),
+          "自沈與被殺並存 → 終局互斥", str(ks))
+    check(huijian._attributable("孫恩乃赴海自沈。", "孫恩",
+                                re.search("孫恩", "孫恩乃赴海自沈。"), 25),
+          "基線的終局詞表也認得自沈")
+
+
+def test_coverage_report():
+    print("16i. cover：逐陣營數出能不能做人物比對")
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        for book, names in (("宋史", ["列传_卷一", "列传_卷二", "本纪_卷一"]),
+                            ("辽史", ["列传_卷一", "本纪_卷一"]),
+                            ("梁书", ["原文版梁书_卷一"])):
+            d = pathlib.Path("corpus") / book
+            d.mkdir(parents=True)
+            for n in names:
+                (d / f"{n}.txt").write_text("文", encoding="utf-8")
+        rows = {r["book"]: r for r in huijian.coverage()}
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+    check(rows["宋史"]["bio"] == 2, "《宋史》數得 2 卷列傳",
+          str(rows["宋史"]["bio"]))
+    check(rows["梁书"]["bio"] is None,
+          "《梁書》檔名未分門類 → 回傳 None，不假裝數得出來",
+          str(rows["梁书"]["bio"]))
+    check(rows["三国志"]["juan"] == 0, "語料裡沒有的書記為 0 卷")
+    check("遼系" in rows["宋史"]["rivals"], "《宋史》的對手含遼系",
+          str(rows["宋史"]["rivals"]))
+    check("明系" not in rows["宋史"]["rivals"],
+          "《明史》不在語料裡，不算對手", str(rows["宋史"]["rivals"]))
+    check(rows["宋史"]["eras"] > 100,
+          f"《宋史》斷代內有 {rows['宋史']['eras']} 個年號可換算")
 
 
 if __name__ == "__main__":
@@ -941,7 +1108,16 @@ if __name__ == "__main__":
               test_sole_record_flag_downweighted,
               test_agreement_within_lineage_is_not_corroboration,
               test_single_witness_is_not_a_signal,
-              test_offperiod_books_excluded):
+              test_offperiod_books_excluded,
+              test_rival_camps_same_compiler,
+              test_span_overlap_blocks_absurd_pairs,
+              test_eras_cover_through_ming,
+              test_era_collision_across_dynasties,
+              test_era_table_dynasty_consistency,
+              test_era_usage_substring_guard,
+              test_era_usage_ignores_lone_outlier,
+              test_suicide_is_an_act,
+              test_coverage_report):
         t()
         print()
     if FAIL:
