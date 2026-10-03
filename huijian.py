@@ -41,6 +41,67 @@ STANCE = {
     "史记": "漢修", "汉书": "漢修", "后汉书": "南朝修", "三国志": "晋修",
 }
 
+# ── 各書的紀事起訖（公元）────────────────────────────────
+# 兩個用處：年號消歧（《泰始二年》在《晉書》是 266、在《宋書》是 466）,
+# 以及判斷一部書的沉默有沒有意義 —— 《三國志》不記張稷不是諱飾。
+BOOK_SPAN = {
+    "史记": (-2100, -90), "汉书": (-206, 23), "后汉书": (25, 220),
+    "三国志": (184, 280), "晋书": (220, 420),
+    "宋书": (420, 479), "南齐书": (479, 502), "梁书": (502, 557),
+    "陈书": (557, 589), "南史": (420, 589),
+    "魏书": (386, 550), "北齐书": (534, 577), "周书": (535, 581),
+    "北史": (386, 618), "隋书": (581, 618),
+    "旧唐书": (618, 907), "新唐书": (618, 907),
+    "旧五代史": (907, 960), "新五代史": (907, 960),
+    "宋史": (960, 1279), "辽史": (907, 1125), "金史": (1115, 1234),
+    "元史": (1206, 1368), "明史": (1368, 1644),
+}
+
+
+# ── 源流關係：哪部書是哪部書的刪削派生本 ──────────────────────
+# 為什麼非得標出來：立場軸上的每一個信號都預設各書互為獨立證人,
+# 而派生本與其史源**逐字雷同是常態**。兩者一致不構成互證（那只是抄錄）,
+# 兩者不一致才有意義（那是改筆）。把源流對當成跨立場互證,
+# 等於把「抄得很像」讀成「兩方都這麼說」。
+#
+# 實測：郁洲案例的 22 組事件對照裡 12 組是源流對，而權重最高的一組是
+# 《梁書》「以吳興太守張稷为尚書左僕射」對《南史》同句作「爲」——
+# 差別只有一個異體字，卻拿到權重 9。
+DERIVED_FROM = {
+    "南史": {"宋书", "南齐书", "梁书", "陈书"},
+    "北史": {"魏书", "北齐书", "周书", "隋书"},
+    "新唐书": {"旧唐书"},
+    "新五代史": {"旧五代史"},
+}
+
+
+def derivation(a, b):
+    """兩書是否為源流關係。回傳 (派生本, 史源)，否則 None。"""
+    if b in DERIVED_FROM.get(a, ()):
+        return a, b
+    if a in DERIVED_FROM.get(b, ()):
+        return b, a
+    return None
+
+
+def independent_witnesses(books):
+    """去掉「史源也在場」的派生本，回傳 (獨立史源, [(派生本, 理由)])。
+
+    派生本只在其史源缺席時才算一個獨立證人 —— 此時它所存的可能正是
+    已散佚的史源文字（《宋書》《南齊書》缺列傳，《南史》往往是唯一
+    所存，見 README「語料」一節）。史源在場時，它不添任何獨立性。
+    """
+    books = set(books)
+    keep, drop = set(), []
+    for b in sorted(books):
+        src = sorted(DERIVED_FROM.get(b, set()) & books)
+        if src:
+            drop.append((b, "刪削自《" + "》《".join(src) + "》，與史源同在，不另計"))
+        else:
+            keep.add(b)
+    return keep, drop
+
+
 # ── 行為類型與互斥規則（確定性層）────────────────────────────
 ACTS = ["除授", "罢黜", "赴任", "征战", "战胜", "战败", "死于战", "病卒",
         "被杀", "归降", "被俘", "叛乱", "筑城", "赈济", "上书", "出使",
@@ -732,6 +793,30 @@ def apply_aliases(rows, amap):
     return n
 
 
+def _relevant_stances(books, all_stances):
+    """哪些立場的書，其紀事年代與現有記載重疊 —— 只有這些書的沉默有意義。
+
+    《三國志》不記張稷（卒 513）不是諱飾，它記的是三國。舊版把語料裡
+    出現過的每一個立場都算進「無載」，於是「僅見於」幾乎必然觸發 ——
+    **這正是它通不過置換檢驗的機制**：打亂立場標籤不影響各書的斷代,
+    所以旗標數量一點不降。它量到的是書的起訖，不是立場。
+    """
+    spans = [BOOK_SPAN[b] for b in books if b in BOOK_SPAN]
+    if not spans:
+        return list(all_stances)
+    lo, hi = min(x[0] for x in spans), max(x[1] for x in spans)
+    out = []
+    for s in all_stances:
+        for b, st in STANCE.items():
+            if st != s or b not in BOOK_SPAN:
+                continue
+            blo, bhi = BOOK_SPAN[b]
+            if blo <= hi and lo <= bhi:          # 年代重疊
+                out.append(s)
+                break
+    return out
+
+
 def _distinct_times(times):
     """把彼此相容的紀年寫法收成一個。
 
@@ -756,6 +841,8 @@ def analyse(rows, all_stances, baseline=None, pairs=None):
     for name, hits in people.items():
         stances = sorted({h["stance"] for h in hits})
         acts = sorted({a for h in hits for a in h.get("acts", [])})
+        # 立場軸上的信號都預設各書互相獨立，派生本會虛增這個數。
+        ind, derived = independent_witnesses({h["book"] for h in hits})
         flags = []
 
         term = [a for a in acts if a in TERMINAL]
@@ -793,8 +880,17 @@ def analyse(rows, all_stances, baseline=None, pairs=None):
                     wt = 5
                     why = (f"「{'、'.join(silent)}」記其人而不記其終。"
                            f"一方詳其死、另一方諱其死，曲筆之典型。")
+                    wb = sorted({h["book"] for h in hits
+                                 if a in h.get("acts", [])})
                     sb = sorted({h["book"] for h in hits
                                  if h.get("stance") in silent})
+                    # 有載的一方若全是沉默那一方的派生本，這不是兩系相左,
+                    # 而是同一脈之內的增補或脫文 —— 派生本不是獨立的
+                    # 第二個證人，它的沉默與其史源的沉默不互相印證。
+                    srcs = sorted({s for x in wb
+                                   for s in DERIVED_FROM.get(x, ()) if s in sb})
+                    same_lineage = bool(srcs) and all(
+                        DERIVED_FROM.get(x, set()) & set(sb) for x in wb)
                     rs = [(b, baseline[b]["rate"], baseline[b]["n"])
                           for b in sb
                           if baseline and b in baseline
@@ -802,7 +898,13 @@ def analyse(rows, all_stances, baseline=None, pairs=None):
                           # 樣本不足的比率不可用來調權重：0/3 與 0/300
                           # 在數字上都是 0%，證據力卻差了兩個數量級。
                           and baseline[b].get("n", 0) >= BASELINE_MIN_N]
-                    if rs:
+                    if same_lineage:
+                        wt = 2
+                        why = (f"《{'》《'.join(wb)}》記其終，而其史源"
+                               f"《{'》《'.join(srcs)}》不記 —— 前者係刪削"
+                               f"後者而成，同屬一脈，**不構成跨立場相左**。"
+                               f"這是派生本的增補或史源的脫文，權重已下調。")
+                    elif rs:
                         bk, rate, n = max(rs, key=lambda x: x[1])
                         why += f"\n      基線：《{bk}》對同類人物的終局著錄率 " \
                                f"{rate:.0%}（n={n}）。"
@@ -817,19 +919,56 @@ def analyse(rows, all_stances, baseline=None, pairs=None):
                     flags.append((wt, f"終局獨載（{a}）：僅「{'、'.join(who)}」有載",
                                   why))
 
-        missing = [s for s in all_stances if s not in stances]
-        if len(all_stances) > 1 and missing:
-            flags.append((3, f"僅見於「{'、'.join(stances)}」",
-                          f"「{'、'.join(missing)}」無載。可能是諱飾，也可能該書本不記此類事，"
-                          f"或材料散佚。需比對同類人物的正常著錄率再判斷"
-                          f"（`huijian.py baseline` 可算，但目前只算終局著錄率，"
-                          f"不算「是否提及」的著錄率）。"))
+        # 只拿斷代重疊的書來問「為什麼它不記」。
+        rel = _relevant_stances({h["book"] for h in hits}, all_stances)
+        offperiod = [s for s in all_stances if s not in rel]
+        missing = [s for s in rel if s not in stances]
+        if len(ind) <= 1 and len(hits) >= 1:
+            # 只有一個獨立史源時，「僅見於某系」是同義反覆 —— 它必然成立,
+            # 不含任何立場信息。這才是該旗標通不過置換檢驗的真正原因：
+            # 實測本案例 24 人中 19 人只見於一部書，怎麼打亂立場標籤,
+            # 「僅見於」都會觸發。把這種情形改報為孤證，權重 0,
+            # 信號留給真正有兩個以上獨立史源的人物。
+            msg = f"獨立史源只有《{'》《'.join(sorted(ind))}》"
+            if derived:
+                msg += ("，另有" + "；".join(f"《{b}》{r}" for b, r in derived)
+                        + "（同脈之內的雷同是抄錄，不是第二個證人）")
+            flags.append((0, "孤證：僅一個獨立史源",
+                          msg + "。無從互見 —— 此時「僅見於某系」是同義反覆，"
+                          "故不計為信號。本工具對這類人物幫不上忙，"
+                          "只能告訴你去哪看。"))
+        elif len(rel) > 1 and missing:
+            # 權重 1，不是 3。置換檢驗（`huijian.py null`）實測把立場標籤
+            # 在書之間打亂，本旗標的數量一點不降（實測 24 對虛無均值
+            # 24.00，p=1.000）—— 它量到的是語料覆蓋稀疏，不是立場差異。
+            # 一個通不過自己虛無檢驗的信號不該按證據計分。
+            why = (f"「{'、'.join(missing)}」無載。**這不是立場證據** —— "
+                   f"置換檢驗實測本旗標打亂立場標籤後數量不降（p≈1.0）,"
+                   f"因為這批人多數只在一部書裡出現過。它量到的是語料覆蓋"
+                   f"稀疏，不是諱飾。只能當「去這幾部書翻翻」的索引用。")
+            if offperiod:
+                why += (f"\n      斷代不重疊、未計入：{'、'.join(offperiod)}"
+                        f"　（那些書記的不是這段時期，其沉默無意義）。")
+            if derived:
+                why += ("\n      源流："
+                        + "；".join(f"《{b}》{r}" for b, r in derived)
+                        + f"　獨立史源實為 {len(ind)} 部。")
+            flags.append((1, f"僅見於「{'、'.join(stances)}」", why))
 
         if len(hits) > 1 and not flags:
-            flags.append((1, "多處互見，無衝突", "記載彼此一致，可作交叉佐證。"))
+            if len(ind) > 1:
+                flags.append((1, "多處互見，無衝突",
+                              "記載彼此一致，且出自互相獨立的史源，可作交叉佐證。"))
+            else:
+                # 派生本與其史源一致只說明抄錄過，不是兩個證人都這麼說。
+                flags.append((0, "多處互見，但非獨立",
+                              "記載彼此一致，但"
+                              + "；".join(f"《{b}》{r}" for b, r in derived)
+                              + "。同脈之內的雷同是抄錄，不構成交叉佐證。"))
 
         out.append({"person": name, "stances": stances, "acts": acts,
                     "flags": flags, "hits": hits,
+                    "witnesses": sorted(ind), "derived": derived,
                     "score": sum(w for w, _, _ in flags)})
     return sorted(out, key=lambda x: -x["score"])
 
@@ -839,7 +978,11 @@ def report(res, dropped, fh=sys.stdout, note=""):
     if note:
         print(f"\n⚠ {note}\n", file=fh)
     for p in res:
-        print(f"\n■ {p['person']}　[{'|'.join(p['stances'])}]　權重 {p['score']}", file=fh)
+        wits = p.get("witnesses")
+        print(f"\n■ {p['person']}　[{'|'.join(p['stances'])}]　權重 {p['score']}"
+              + (f"　獨立史源 {len(wits)}" if wits else ""), file=fh)
+        for b, r in p.get("derived") or []:
+            print(f"  ◇ 源流：《{b}》{r}", file=fh)
         for e in p.get("known") or []:
             src = e.get("source") or "未註明出處"
             tp = f"（{e['topic']}）" if e.get("topic") else ""

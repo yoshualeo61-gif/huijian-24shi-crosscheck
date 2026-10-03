@@ -19,3 +19,4 @@ venv/
 # 標注產出（含人工判斷，視情況決定是否入庫）
 annot_*.json
 annot_*.txt
+real_v*/

@@ -10,7 +10,12 @@
     python duizhao.py align findings.json          # 事件對照
 """
 
-import argparse, itertools, json, re, sys
+import argparse, difflib, itertools, json, os, re, sys
+
+# 源流關係表定義在 huijian.py（與 STANCE 同處），這裡 import 而不複製 ——
+# UI 層曾因為自己重寫一份判斷邏輯而與 Python 層漂移，不再犯第二次。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from huijian import BOOK_SPAN, DERIVED_FROM, derivation  # noqa: E402
 
 # Windows 預設以本地代碼頁寫 stdout，重定向到檔案時中文即 UnicodeEncodeError。
 for _s in (sys.stdout, sys.stderr):
@@ -69,18 +74,7 @@ ERAS.sort(key=lambda e: -len(e[0]))          # 長年號優先，免得「大通
 
 # 各書記事大致起訖（公元），僅用於同名年號消歧。寬鬆取界，
 # 只求排除百年量級的誤判，不作精確斷限。
-BOOK_SPAN = {
-    "史记": (-2100, -90), "汉书": (-206, 23), "后汉书": (25, 220),
-    "三国志": (184, 280), "晋书": (220, 420),
-    "宋书": (420, 479), "南齐书": (479, 502), "梁书": (502, 557),
-    "陈书": (557, 589), "南史": (420, 589),
-    "魏书": (386, 550), "北齐书": (534, 577), "周书": (535, 581),
-    "北史": (386, 618), "隋书": (581, 618),
-    "旧唐书": (618, 907), "新唐书": (618, 907),
-    "旧五代史": (907, 960), "新五代史": (907, 960),
-    "宋史": (960, 1279), "辽史": (907, 1125), "金史": (1115, 1234),
-    "元史": (1206, 1368), "明史": (1368, 1644),
-}
+# BOOK_SPAN 已移至 huijian.py（與 STANCE、DERIVED_FROM 同處）。
 
 CN = {"元": 1, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
       "七": 7, "八": 8, "九": 9, "十": 10}
@@ -192,6 +186,17 @@ def parse_date(row):
             "first_year": bool(y and y[2] == 1)}
 
 
+# 兩段引文相似到這個比例以上，就當成純抄錄 —— 沒有信息可言。
+COPY_RATIO = 0.88
+
+
+def text_ratio(a, b):
+    """兩段引文的相似度。標點不計，異體字靠比例容忍，不另立字表。"""
+    strip = str.maketrans("", "", "，。；：、！？「」『』（）()")
+    return difflib.SequenceMatcher(
+        None, (a or "").translate(strip), (b or "").translate(strip)).ratio()
+
+
 # ── 立場用語：同一事，勝方與敗方措辭不同 ──────────────────
 STANCE_LEX = {
     "歸附": ["内附", "內附", "归诚", "歸誠", "来降", "來降", "归化", "歸化",
@@ -200,8 +205,16 @@ STANCE_LEX = {
     "敵來": ["寇", "侵", "入寇", "犯"],
     "我往": ["讨", "討", "征", "伐", "平", "克"],
     "蔑稱": ["岛夷", "島夷", "索虏", "索虜", "僭", "伪", "偽", "贼", "賊"],
+    # 同一個被殺的君主，一方稱「帝」、一方用貶諡，這是春秋筆法最直接的
+    # 一種：改的不是動詞，是被殺者的身分。實測《梁書》作「斬東昏」、
+    # 《南史》作「殺帝」—— 同一天同一事，殺的是「廢帝」還是「皇帝」。
+    #
+    # **詞表是從這一個案例起的頭，遠不完備**，與其餘判定參數同樣未經
+    # 標注驗證（見 README 末段）。類別是真的，條目要續補。
+    "尊號": ["帝", "天子", "主上", "乘舆", "乘輿"],
+    "廢號": ["东昏", "東昏", "废帝", "廢帝", "昏主", "苍梧", "蒼梧"],
 }
-OPPOSED = [("歸附", "叛離"), ("敵來", "我往")]
+OPPOSED = [("歸附", "叛離"), ("敵來", "我往"), ("尊號", "廢號")]
 
 
 def lex_tags(text):
@@ -241,6 +254,15 @@ def pair_score(a, b):
     if (a["year"] and b["year"]
             and abs(a["year"][0] - b["year"][0]) > YEAR_GAP_MAX):
         return 0, []                     # 年代相去太遠，不是同一事
+    # 一個月裡每個日干支最多出現一次，所以同月而干支不同就是兩天。
+    # 行為又無重疊時判為兩件事 —— 實測《梁書》「十二月丙申，以國子祭酒
+    # 張稷為護軍將軍」曾與《南史》「十二月丙寅，…率兵入殿殺帝」配成
+    # 一組，只靠同人物（＋3）同月（＋2）就過了門檻。
+    # 行為重疊時不否證：那才是兩書對同一事各繫一日，即日次歧異。
+    if (a["month"] and a["month"] == b["month"] and a["leap"] == b["leap"]
+            and a["ganzhi"] and b["ganzhi"] and a["ganzhi"] != b["ganzhi"]
+            and not (a["acts"] & b["acts"])):
+        return 0, []
     if a["person"] and a["person"] == b["person"]:
         s += 3
         why.append(f"同人物 {a['person']}")
@@ -331,9 +353,35 @@ def align(rows, threshold=4, cross_stance_only=True):
         if s < threshold:
             continue
         d = diverge(rows[i], rows[j], A[i], A[j])
-        pairs.append({"a": rows[i], "b": rows[j], "score": s,
-                      "anchors": why, "diverge": d,
-                      "weight": s + sum(w for w, _, _ in d)})
+        rel = derivation(rows[i].get("book", ""), rows[j].get("book", ""))
+        if rel:
+            # 源流對：派生本與史源逐字雷同是常態，所以**錨定一致不計分**,
+            # 那只是抄錄。有意義的只有出入 —— 那是看得見的改筆。
+            # 全無出入的源流對直接不報：實測權重最高的一組是《梁書》
+            # 「为」對《南史》「爲」，差別只有一個異體字。
+            if not d:
+                # 一條已分類的出入都沒有，先看兩段文字是不是幾乎一樣。
+                # 幾乎一樣 → 純抄錄，沒有信息（《梁書》「为」對《南史》
+                # 「爲」）。差得明顯卻一條都歸不了類 → 有出入而本工具的
+                # 詞表叫不出名字，那要報出來，不能靜默丟掉 ——
+                # 初版的這個 continue 把《梁書》「斬東昏」對《南史》
+                # 「殺帝」整組丟了，而那正是本案例最有價值的一條。
+                if text_ratio(rows[i].get("evidence"),
+                              rows[j].get("evidence")) >= COPY_RATIO:
+                    continue
+                d = [(1, "出入未能歸類",
+                      "兩處敘述明顯不同，但本工具的立場詞表歸不出類別，"
+                      "須人工比讀。詞表不完備是已知局限，不是此處無異。")]
+            d = [(w, "改筆" if k == "立場用語對立" else k, t) for w, k, t in d]
+            pairs.append({"a": rows[i], "b": rows[j], "score": s,
+                          "anchors": why, "diverge": d,
+                          "relation": ("源流", rel[0], rel[1]),
+                          "weight": sum(w for w, _, _ in d)})
+        else:
+            pairs.append({"a": rows[i], "b": rows[j], "score": s,
+                          "anchors": why, "diverge": d,
+                          "relation": ("獨立", None, None),
+                          "weight": s + sum(w for w, _, _ in d)})
     return sorted(pairs, key=lambda p: -p["weight"])
 
 
@@ -341,7 +389,15 @@ def show(pairs, fh=sys.stdout):
     print(f"\n{'='*70}\n事件對照 {len(pairs)} 組\n{'='*70}", file=fh)
     for p in pairs:
         a, b = p["a"], p["b"]
-        print(f"\n■ 權重 {p['weight']}　錨定：{'；'.join(p['anchors'])}", file=fh)
+        rel = p.get("relation") or ("獨立", None, None)
+        if rel[0] == "源流":
+            print(f"\n■ 權重 {p['weight']}　【源流對】《{rel[1]}》刪削自"
+                  f"《{rel[2]}》—— 雷同是抄錄，不計互證分，以下只列其出入",
+                  file=fh)
+            print(f"　　（同事錨定：{'；'.join(p['anchors'])}）", file=fh)
+        else:
+            print(f"\n■ 權重 {p['weight']}　錨定：{'；'.join(p['anchors'])}",
+                  file=fh)
         for w, k, why in p["diverge"]:
             print(f"  {'⚠' if w >= 4 else '·'} {k}　{why}", file=fh)
         for r in (a, b):

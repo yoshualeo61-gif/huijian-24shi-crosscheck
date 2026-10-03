@@ -199,12 +199,16 @@ def test_person_normalization():
           "善明 → 劉善明", str(cands[0].get("suggest")))
     check(cands[0]["ambiguous"] is False, "唯一候選不標 ambiguous")
 
-    # 未歸一：兩條各自成人，兩邊都被誤報「僅見於」
+    # 未歸一：兩條各自成人，於是兩邊各自只剩一個獨立史源 —— 兩邊都
+    # 淪為孤證，跨立場比對整個落空。代價和從前一樣大，只是現在報得
+    # 更誠實：不再誤報成「僅見於某系」那種看似有內容的立場信號。
     before = huijian.analyse([dict(r) for r in rows], ["南朝系", "北朝系"])
     flags_before = [k for p in before for _, k, _ in p["flags"]]
     check(len(before) == 2, "未歸一時算成兩個人", f"got {len(before)}")
-    check(sum("僅見於" in k for k in flags_before) == 2,
-          "未歸一時兩邊都誤報僅見於", str(flags_before))
+    check(sum("孤證" in k for k in flags_before) == 2,
+          "未歸一時兩邊都淪為孤證", str(flags_before))
+    check(not any("僅見於" in k for k in flags_before),
+          "且不再誤報成立場信號", str(flags_before))
 
     # 歸一後：一個人，跨立場，誤報消失
     merged = [dict(r) for r in rows]
@@ -676,6 +680,227 @@ def test_far_years_disqualify_pairing():
     check(sc2 > 0, "相差一年仍可並置", str(sc2))
 
 
+# ── 15. 源流關係：派生本不是獨立證人 ─────────────────────────
+# 立場軸上每一個信號都預設各書互為獨立證人，而派生本與其史源逐字雷同
+# 是常態。一致不構成互證（那只是抄錄），不一致才有意義（那是改筆）。
+def test_derivation_table():
+    print("15. 源流關係表")
+    check(huijian.derivation("南史", "梁书") == ("南史", "梁书"),
+          "《南史》刪削《梁書》", str(huijian.derivation("南史", "梁书")))
+    check(huijian.derivation("梁书", "南史") == ("南史", "梁书"),
+          "順序無關，派生本在前回傳")
+    check(huijian.derivation("北史", "魏书") == ("北史", "魏书"),
+          "《北史》刪削《魏書》")
+    # 《晉書》雖同為唐修，卻不是《宋書》的派生本 —— 兩者題材相鄰而
+    # 無源流關係，是貨真價實的獨立比對。
+    check(huijian.derivation("宋书", "晋书") is None,
+          "《宋書》《晉書》同為唐修前後，但無源流關係")
+    check(huijian.derivation("魏书", "梁书") is None, "南北兩書無源流關係")
+
+
+def test_independent_witnesses():
+    print("15b. 獨立史源計數")
+    keep, drop = huijian.independent_witnesses({"梁书", "南史"})
+    check(keep == {"梁书"}, "史源在場時派生本不另計", str(keep))
+    check(len(drop) == 1 and drop[0][0] == "南史", "並說明被扣除的理由",
+          str(drop))
+    # 《宋書》《南齊書》缺列傳，《南史》往往是唯一所存 —— 史源缺席時
+    # 派生本就是一個獨立證人，不能一概扣除。
+    keep2, drop2 = huijian.independent_witnesses({"南史"})
+    check(keep2 == {"南史"} and not drop2,
+          "史源缺席時派生本自身算一個證人", str(keep2))
+    keep3, _ = huijian.independent_witnesses({"梁书", "南史", "魏书"})
+    check(keep3 == {"梁书", "魏书"}, "三部書裡只扣派生本", str(keep3))
+
+
+def test_pure_copy_pair_dropped():
+    print("15c. 純抄錄的源流對不報")
+    # 實測權重最高的一組是《梁書》「以吳興太守張稷为尚書左僕射」對
+    # 《南史》同句作「爲」—— 差別只有一個異體字，卻拿到權重 9。
+    a = {"person": "张稷", "place": "", "time": "冬十月丙寅", "acts": ["除授"],
+         "evidence": "冬十月丙寅，以吴兴太守张稷为尚书左仆射",
+         "book": "梁书", "juan": "卷二", "stance": "南朝系"}
+    b = dict(a, book="南史", juan="卷六", stance="唐修",
+             evidence="冬十月丙寅，以吴兴太守张稷爲尚书左仆射")
+    check(duizhao.text_ratio(a["evidence"], b["evidence"]) >= duizhao.COPY_RATIO,
+          f"相似度 {duizhao.text_ratio(a['evidence'], b['evidence']):.2f} "
+          f"≥ {duizhao.COPY_RATIO}")
+    check(duizhao.align([a, b]) == [], "一字之差的源流對不產出對照組")
+
+
+def test_derivative_pair_scores_only_divergence():
+    print("15d. 源流對只算出入，不算錨定")
+    # 《梁書》作「斬東昏」、《南史》作「殺帝」—— 同一天同一事，
+    # 殺的是「廢帝」還是「皇帝」。這是春秋筆法最直接的一種：
+    # 改的不是動詞，是被殺者的身分。
+    a = {"person": "张稷", "place": "", "time": "十二月丙寅", "acts": ["被杀"],
+         "evidence": "兼卫尉张稷、北徐州刺史王珍国斩东昏，送首义师",
+         "book": "梁书", "juan": "卷一", "stance": "南朝系"}
+    b = {"person": "张稷", "place": "", "time": "十二月丙寅", "acts": ["被杀"],
+         "evidence": "十二月丙寅，新除雍州刺史王珍国、侍中张稷率兵入殿杀帝，时年十九",
+         "book": "南史", "juan": "卷五", "stance": "唐修"}
+    g = duizhao.align([a, b])
+    check(len(g) == 1, "出入明顯的源流對照樣報出", str(len(g)))
+    p = g[0]
+    check(p["relation"][0] == "源流" and p["relation"][1] == "南史",
+          "標為源流對，並指出哪部是派生本", str(p["relation"]))
+    ks = [k for _, k, _ in p["diverge"]]
+    check("改筆" in ks, "立場用語對立在源流對裡改稱「改筆」", str(ks))
+    # 錨定分（同人物 3 ＋ 同月 2 ＋ 同日 3 ＋ 行為重疊 1 ＝ 9）一分不計
+    check(p["weight"] == sum(w for w, _, _ in p["diverge"]),
+          f"權重只來自出入（{p['weight']}），錨定分不計", str(p["score"]))
+    check(p["weight"] < p["score"] + p["weight"],
+          "雷同不加分：抄得越像，權重越低，不是越高")
+
+
+def test_unclassified_divergence_is_reported():
+    print("15e. 歸不出類的出入也要報出來")
+    # 這一條釘死一個我自己犯過的回歸：源流對「沒有已分類的出入就跳過」,
+    # 把《梁書》「斬東昏」對《南史》「殺帝」整組丟掉了 —— 而那是本案例
+    # 最有價值的一條。詞表叫不出名字，不等於此處無異。
+    a = {"person": "张稷", "place": "", "time": "十二月丙寅", "acts": ["被杀"],
+         "evidence": "兼卫尉张稷、北徐州刺史王珍国斩东昏，送首义师",
+         "book": "梁书", "juan": "卷一", "stance": "南朝系"}
+    b = dict(a, book="南史", juan="卷六", stance="唐修",
+             evidence="十二月丙寅，兼卫尉张稷、北徐州刺史王珍国斩东昏，"
+                      "其夜以黄油裹首送军")
+    r = duizhao.text_ratio(a["evidence"], b["evidence"])
+    check(r < duizhao.COPY_RATIO, f"相似度 {r:.2f} 低於抄錄門檻")
+    g = duizhao.align([a, b])
+    check(len(g) == 1, "照樣報出，不靜默丟掉", str(len(g)))
+    ks = [k for _, k, _ in g[0]["diverge"]]
+    check("出入未能歸類" in ks, "並明說是本工具歸不出類，不是此處無異",
+          str(ks))
+
+
+def test_same_month_different_day_is_two_events():
+    print("15f. 同月而干支日不同即兩件事")
+    # 《梁書》「十二月丙申，以國子祭酒張稷為護軍將軍」曾與《南史》
+    # 「十二月丙寅，…率兵入殿殺帝」配成一組，只靠同人物＋同月過門檻。
+    # 一個月裡每個日干支最多出現一次，所以那是兩天。
+    a = {"person": "张稷", "place": "", "time": "十二月丙申", "acts": ["除授"],
+         "evidence": "十二月丙申，以国子祭酒张稷为护军将军",
+         "book": "梁书", "juan": "卷二", "stance": "南朝系"}
+    b = {"person": "张稷", "place": "", "time": "十二月丙寅", "acts": ["叛乱"],
+         "evidence": "十二月丙寅，新除雍州刺史王珍国、侍中张稷率兵入殿杀帝",
+         "book": "南史", "juan": "卷五", "stance": "唐修"}
+    sc, _ = duizhao.pair_score(duizhao.anchors(a), duizhao.anchors(b))
+    check(sc == 0, f"行為不重疊又異日 → 判為兩件事（得 {sc} 分）")
+    # 行為重疊時不否證：那才是兩書對同一事各繫一日，即日次歧異。
+    c = dict(b, acts=["除授"], time="十二月丙寅")
+    sc2, _ = duizhao.pair_score(duizhao.anchors(a), duizhao.anchors(c))
+    check(sc2 > 0, f"行為重疊時仍並置，留給日次歧異去判（得 {sc2} 分）")
+
+
+def test_terminal_silence_within_one_lineage():
+    print("15g. 同脈之內的終局出入不算跨立場相左")
+    rows = [
+        {"person": "甲", "acts": ["赴任"], "time": "", "evidence": "甲之任",
+         "book": "梁书", "juan": "一", "stance": "南朝系"},
+        {"person": "甲", "acts": ["被杀"], "time": "", "evidence": "甲見殺",
+         "book": "南史", "juan": "二", "stance": "唐修"},
+    ]
+    r = huijian.analyse([dict(x) for x in rows], ["南朝系", "唐修"])
+    f = [(w, y) for p in r for w, k, y in p["flags"] if "終局獨載" in k]
+    check(f and f[0][0] == 2, f"《南史》刪削《梁書》，降權為 2",
+          str(f[0][0] if f else None))
+    check(f and "不構成跨立場相左" in f[0][1], "並明說同屬一脈", str(f))
+    # 南北兩書之間則照舊是強信號
+    rows2 = [
+        {"person": "乙", "acts": ["赴任"], "time": "", "evidence": "乙之任",
+         "book": "梁书", "juan": "一", "stance": "南朝系"},
+        {"person": "乙", "acts": ["被杀"], "time": "", "evidence": "乙見殺",
+         "book": "魏书", "juan": "二", "stance": "北朝系"},
+    ]
+    r2 = huijian.analyse([dict(x) for x in rows2], ["南朝系", "北朝系"])
+    f2 = [w for p in r2 for w, k, _ in p["flags"] if "終局獨載" in k]
+    check(f2 and f2[0] == 5, "《魏書》對《梁書》無源流關係，維持 5", str(f2))
+
+
+def test_sole_record_flag_downweighted():
+    print("15h. 僅見於：通不過自己虛無檢驗的信號不按證據計分")
+    # 要有兩個以上獨立史源，「僅見於」才成立（孤證的情形見 15j）。
+    rows = [
+        {"person": "丙", "acts": ["赴任"], "time": "", "evidence": "丙之任",
+         "book": "梁书", "juan": "一", "stance": "南朝系"},
+        {"person": "丙", "acts": ["赴任"], "time": "", "evidence": "丙至郡",
+         "book": "魏书", "juan": "二", "stance": "北朝系"},
+    ]
+    r = huijian.analyse([dict(x) for x in rows],
+                        ["南朝系", "北朝系", "唐修"])
+    f = [(w, y) for p in r for w, k, y in p["flags"] if "僅見於" in k]
+    check(f and f[0][0] == 1, f"權重 1（原為 3）", str(f[0][0] if f else None))
+    check(f and "這不是立場證據" in f[0][1], "報告裡直說它不是立場證據")
+    check(f and "p≈1.0" in f[0][1], "並給出置換檢驗的實測結果")
+
+
+def test_agreement_within_lineage_is_not_corroboration():
+    print("15i. 同脈之內的雷同是抄錄，不是互證")
+    rows = [
+        {"person": "丁", "acts": ["除授"], "time": "", "evidence": "以丁為尚書",
+         "book": "梁书", "juan": "一", "stance": "南朝系"},
+        {"person": "丁", "acts": ["除授"], "time": "", "evidence": "以丁爲尚書",
+         "book": "南史", "juan": "二", "stance": "唐修"},
+    ]
+    r = huijian.analyse([dict(x) for x in rows], ["南朝系", "唐修"])
+    ks = [k for p in r for _, k, _ in p["flags"]]
+    check(not any("交叉佐證" in k or "無衝突" in k for k in ks),
+          "不報「可作交叉佐證」", str(ks))
+    check(any("孤證" in k for k in ks), "報為孤證", str(ks))
+    why = [y for p in r for _, k, y in p["flags"] if "孤證" in k][0]
+    check("南史" in why and "抄錄" in why,
+          "訊息說明《南史》是抄錄而非第二個證人", why)
+    check(r[0]["witnesses"] == ["梁书"], "獨立史源只算《梁書》一部",
+          str(r[0]["witnesses"]))
+    # 獨立的兩部書一致，才是互證
+    rows2 = [
+        {"person": "戊", "acts": ["除授"], "time": "", "evidence": "以戊為尚書",
+         "book": "梁书", "juan": "一", "stance": "南朝系"},
+        {"person": "戊", "acts": ["除授"], "time": "", "evidence": "以戊爲尚書",
+         "book": "魏书", "juan": "二", "stance": "北朝系"},
+    ]
+    ks2 = [k for p in huijian.analyse([dict(x) for x in rows2],
+                                      ["南朝系", "北朝系"])
+           for _, k, _ in p["flags"]]
+    check("多處互見，無衝突" in ks2, "獨立兩書一致才算互證", str(ks2))
+
+
+def test_single_witness_is_not_a_signal():
+    print("15j. 孤證不報「僅見於」")
+    # 一部書記、別家不記，若那部書是唯一的獨立史源，「僅見於」必然成立,
+    # 不含立場信息。實測 24 人中 19 人如此 —— 這才是該旗標通不過置換
+    # 檢驗的真正原因（斷代篩選只去掉 1 條，p 仍是 1.000）。
+    one = [{"person": "庚", "acts": ["赴任"], "time": "", "evidence": "庚之任",
+            "book": "梁书", "juan": "一", "stance": "南朝系"}]
+    r = huijian.analyse(one, ["南朝系", "北朝系"])
+    ks = [k for p in r for _, k, _ in p["flags"]]
+    check(not any("僅見於" in k for k in ks), "孤證不報僅見於", str(ks))
+    check(any("孤證" in k for k in ks), "改報為孤證", str(ks))
+    check(r[0]["score"] == 0, "權重 0，不進排序", str(r[0]["score"]))
+    # 兩個獨立史源時才留給「僅見於」去判
+    # 第三個立場得與斷代重疊，否則會被 _relevant_stances 正確篩掉
+    # （「元修」是《宋史》960–1279，對梁魏兩書毫不相干）。
+    two = one + [{"person": "庚", "acts": ["赴任"], "time": "",
+                  "evidence": "庚至郡", "book": "魏书", "juan": "二",
+                  "stance": "北朝系"}]
+    ks2 = [k for p in huijian.analyse(two, ["南朝系", "北朝系", "唐修"])
+           for _, k, _ in p["flags"]]
+    check(any("僅見於" in k for k in ks2), "兩個獨立史源時照報", str(ks2))
+
+
+def test_offperiod_books_excluded():
+    print("15k. 斷代不重疊的書，其沉默不算無載")
+    # 《三國志》（184–280）不記張稷（卒 513）不是諱飾，它記的是三國。
+    rel = huijian._relevant_stances({"梁书", "魏书"},
+                                    ["南朝系", "北朝系", "晋修", "清修"])
+    check("晋修" not in rel, "《三國志》所屬立場被排除", str(rel))
+    check("清修" not in rel, "《明史》所屬立場被排除", str(rel))
+    check("南朝系" in rel and "北朝系" in rel, "斷代重疊的留下", str(rel))
+    # 語料裡沒有 BOOK_SPAN 的書時，不做篩選，寧可多報不可漏報
+    check(huijian._relevant_stances({"無此書"}, ["甲", "乙"]) == ["甲", "乙"],
+          "無斷代資料時不篩")
+
+
 if __name__ == "__main__":
     for t in (test_scan_keeps_parallel_passages,
               test_scan_still_folds_duplicates_within_a_book,
@@ -705,7 +930,18 @@ if __name__ == "__main__":
               test_baseline_min_n_gate,
               test_era_divergence_only_for_once_only_acts,
               test_compatible_time_strings,
-              test_far_years_disqualify_pairing):
+              test_far_years_disqualify_pairing,
+              test_derivation_table,
+              test_independent_witnesses,
+              test_pure_copy_pair_dropped,
+              test_derivative_pair_scores_only_divergence,
+              test_unclassified_divergence_is_reported,
+              test_same_month_different_day_is_two_events,
+              test_terminal_silence_within_one_lineage,
+              test_sole_record_flag_downweighted,
+              test_agreement_within_lineage_is_not_corroboration,
+              test_single_witness_is_not_a_signal,
+              test_offperiod_books_excluded):
         t()
         print()
     if FAIL:
