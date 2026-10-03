@@ -21,7 +21,10 @@ Claude 自己就是抽取层。把下面整段贴给 Claude Code：
 6. python huijian.py verify work/
 7. 若报告警告「人名归一未完成」，裁定 work/aliases_suggested.json
    → 存成 work/aliases.json，重跑 verify
-8. python duizhao.py align work/findings.json
+8. python huijian.py baseline work/   （算独载基线，需语料）
+9. python huijian.py verify work/     （再跑一次，让基线生效）
+10. python huijian.py null work/      （置换检验，看立场轴是否真有贡献）
+11. python duizhao.py align work/findings.json
 ```
 
 **详见 [docs/07-ClaudeCode工作流.md](docs/07-ClaudeCode工作流.md)** —— 含抽取规格全文、
@@ -98,6 +101,7 @@ python3 -c "import pathlib;[print(d.name,len(list(d.iterdir()))) for d in sorted
 | `ui/shiyuan_reader.jsx` | 标注界面（React artifact） |
 | `samples/` | 郁洲案例的现成史料与测试数据（来源见「语料」一节）|
 | `tests/test_fixes.py` | 回归测试，不需要语料和 API key：`python tests/test_fixes.py` |
+| `data/zhiyi.example.json` | 知异索引的格式示例。**真实条目需自行录入** |
 | `互見_介紹.pptx` | 介绍幻灯片。**有两处失准：**（1）3,034 卷 / 3,021 万字是含译文的旧数据，正确值见上；（2）第 6 页写校验闸「按偏移重新切片，逐字节比对」，实际实现是子串测试 `ev in ck`，拦得住改写和虚构，但拦不住拼接（见文档 06）|
 
 ## 文档
@@ -118,7 +122,32 @@ python3 -c "import pathlib;[print(d.name,len(list(d.iterdir()))) for d in sorted
 2. **别指望挖出新史料，指望读得快。** 优势是不知疲倦，不是更聪明。
 3. **「为什么」类的判断不要信。** 谁、何时、何地可靠；动机不可靠。
 
-## 当前状态 v0.2.2
+## 当前状态 v0.2.3
+
+v0.2.3 补的四层，都指着同一件事：**让权重从拍脑袋变成可以被指着反驳的数字。**
+
+**独载基线（`huijian.py baseline`）。** 「某书记其人而不记其终」要成为讳饰的
+证据，先得知道该书记同类人之死的正常比率。现在算得出来了：比率低于 30% 的书，
+其沉默从 ⚠ 降为 ·，权重 5 → 2，基线数字写进报告理由。实测里它做的第一件事
+就是**把本工具自己最响的信号调低**——这正是它该做的。基线本身的三处误差
+写在文档 06，没有藏。
+
+**月份与干支日锚定。** 《南齐书》与《南史》同记「二月丁卯」，此前一分未得；
+现在同月 +2、同年同月又同干支 +3，样例的锚定权重从 11 升到 16。干支只在
+月份之后近处采信（干支也用于纪年和人名），不换算成公元日。附带标出
+日次歧异、闰月歧异；差一年又涉改元元年的「歧异」则降权，因为那很可能
+只是改元月份的算法之异。
+
+**置换检验（`huijian.py null`）。** 把立场标签在书之间打乱，重算各类信号，
+给出 p 值。立场轴是全部跨立场信号的前提——打乱后信号不降，那些信号就不是
+立场差异造成的。不需要金标准，不需要语料。注意有些信号按构造就与立场无关
+（如终局互斥），p 接近 1 是对的，不是缺陷。
+
+**知异索引（已知集合减法）。** 机制建好了，**索引是空的**：考异原书需自行
+录入，代录即是编造。未载入索引时，报告顶部会写明「新颖性未知」并明确禁止
+据此声称新发现。这不是解决，是把一个沉默的认知缺口变吵闹。
+
+## 之前：v0.2.2
 
 v0.2.2 补了两处——不是修 bug，是把两个已知缺口做掉：
 

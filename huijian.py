@@ -12,7 +12,7 @@
     python huijian.py run 郁洲 -o out/          # 全流程 (需 ANTHROPIC_API_KEY)
 """
 
-import argparse, collections, html, json, os, pathlib, re, subprocess, sys
+import argparse, collections, html, json, os, pathlib, random, re, subprocess, sys
 import urllib.request
 
 # Windows 預設以本地代碼頁寫 stdout，一旦重定向到檔案，中文即 UnicodeEncodeError。
@@ -47,6 +47,18 @@ ACTS = ["除授", "罢黜", "赴任", "征战", "战胜", "战败", "死于战",
         "逃亡", "受封赏"]
 TERMINAL = {"死于战", "病卒", "被杀", "归降", "被俘"}   # 任兩者並存＝硬矛盾
 PAIRS = [("战胜", "战败"), ("除授", "罢黜")]
+
+# 終局用語：供基線統計用的保守詞表。只收歧義小的，寧漏不濫 ——
+# 基線本身若充滿誤判，拿它校準別的判斷就毫無意義。
+TERMINAL_LEX = [
+    "卒", "薨", "殂",                                      # 病卒
+    "見殺", "见杀", "伏誅", "伏诛", "賜死", "赐死",
+    "坐誅", "坐诛", "梟首", "枭首", "斬之", "斩之", "遇害",   # 被殺
+    "戰死", "战死", "沒於陣", "没于阵", "力戰而死", "力战而死",  # 死於戰
+    "被擒", "見擒", "见擒", "為所執", "为所执",              # 被俘
+    "內附", "内附", "歸降", "归降", "來降", "来降",
+    "舉城降", "举城降",                                     # 歸降
+]
 
 # 一個 chunk 可能由同卷中數個不相鄰的窗口拼成，接縫處插入此標記。
 # 校驗要求引文完整落在單一窗口內 —— 跨縫即拼接，一律丟棄。
@@ -262,6 +274,226 @@ def extract(hits, key, limit=0, dry=False, debug=False):
     return rows, dropped
 
 
+# ── 基線：該書記同類人之死的正常比率 ──────────────────────
+def _attributable(s, nm, m, window, others):
+    """名字附近的終局用語是否可歸於本人。
+
+    若名字與該用語之間夾著另一個對照名，這用語更可能是那個人的 ——
+    本紀一段之內常列數人數死，不加這個條件，基線會被鄰人的死灌水，
+    而基線一高，獨載的沉默就都顯得正常，遮掉真信號。
+    """
+    a = max(0, m.start() - window)
+    b = min(len(s), m.end() + window)
+    for w in TERMINAL_LEX:
+        for g in re.finditer(re.escape(w), s[a:b]):
+            p0, p1 = a + g.start(), a + g.end()
+            if p1 <= m.start():
+                between = s[p1:m.start()]
+            elif p0 >= m.end():
+                between = s[m.end():p0]
+            else:
+                between = ""
+            if any(o in between for o in others):
+                continue                     # 中間隔著別人，不算本人的
+            return True
+    return False
+
+
+def terminal_rate(names, window=120):
+    """每部書的「終局著錄率」。
+
+    對每個（人名, 書）組合：該書若提及此人，其名前後 window 字內是否出現
+    終局用語。比率 ＝ 有終局者 ／ 提及者。
+
+    這是獨載檢測一直缺的那塊。「某書記其人而不記其終」要成為諱飾的證據，
+    先得知道該書記同類人之死的正常比率有多高 —— 比率本就低的書，
+    沉默什麼也說明不了。全程確定性統計，不需要標註，也不呼叫模型。
+
+    歸屬用「中間不得夾著別人」的規則（見 _attributable）。這仍是近似：
+    詞表只收歧義小的詞，窗口也是拍的，所以比率有誤差。但它是**可審的**
+    近似 —— 規則寫在這兒，可以指著說這條不對。
+    """
+    stat = {}
+    for f in sorted(COR.rglob("*.txt")):
+        if any(w in f.name for w in ("译文", "譯文", "白话", "白話", "段译")):
+            continue
+        book = f.parts[1]
+        s = norm_text(f)
+        for nm in names:
+            if nm not in s:
+                continue
+            d = stat.setdefault(book, {"seen": set(), "term": set()})
+            d["seen"].add(nm)
+            others = [o for o in names if o != nm and o not in nm]
+            for m in re.finditer(re.escape(nm), s):
+                if _attributable(s, nm, m, window, others):
+                    d["term"].add(nm)
+                    break
+    out = {}
+    for book, d in stat.items():
+        n, k = len(d["seen"]), len(d["term"])
+        out[book] = {"n": n, "k": k, "rate": (k / n) if n else None}
+    return out
+
+
+def _names_from_work(w):
+    """工作目錄裡能找到的人名，供基線的對照群體用。"""
+    names = set()
+    for fn in ("findings.json", "extracted.json", "extracted2.json"):
+        p = w / fn
+        if not p.exists():
+            continue
+        data = json.load(open(p, encoding="utf-8"))
+        for it in data:
+            if it.get("person"):
+                names.add(it["person"])
+            for h in it.get("hits") or []:
+                if h.get("person"):
+                    names.add(h["person"])
+    return sorted(names)
+
+
+def cmd_baseline(a):
+    """算基線並寫入 work/baseline.json，供 verify 校準獨載權重。"""
+    w = pathlib.Path(a.out)
+    names = _names_from_work(w)
+    if not names:
+        sys.exit(f"{w} 裡找不到人名（需先跑 verify 或抽取）")
+    print(f"對照群體 {len(names)} 人：{'、'.join(names[:10])}"
+          f"{'…' if len(names) > 10 else ''}\n", file=sys.stderr)
+    base = terminal_rate(names, a.window)
+    _dump(w / "baseline.json", base)
+    print(f"{'書':10s} {'提及':>5s} {'記其終':>6s} {'著錄率':>7s}")
+    for b, d in sorted(base.items(), key=lambda x: -(x[1]["rate"] or 0)):
+        print(f"{b:10s} {d['n']:5d} {d['k']:6d} {d['rate']:7.0%}")
+    print(f"\n→ {w}/baseline.json　下次 verify 會自動讀取並據以校準獨載權重",
+          file=sys.stderr)
+
+
+# ── 知異：已知集合減法 ────────────────────────────────────
+# 系統分不清哪條是新發現、哪條是錢大昕兩百年前就寫過的。沒有這層掩碼，
+# 任何「新發現」的說法都不成立 —— 所以寧可讓報告大聲說「新穎性未知」,
+# 也不要讓它默不作聲地任人誤會。
+#
+# 索引是一個 JSON 陣列，每筆：
+#   {"person": "張稷", "book": "魏書", "juan": "卷六十一",
+#    "topic": "卒年", "source": "錢大昕《廿二史考異》卷三十", "note": "…"}
+# person 必填，其餘可空；book／juan 給了就一併比對。
+# 倉庫**不附任何條目** —— 考異原書需自行取得並錄入，代錄即是編造。
+ZHIYI_FILES = ("zhiyi.json", "data/zhiyi.json")
+
+
+def load_zhiyi(w):
+    """從工作目錄或倉庫根目錄讀知異索引。沒有就回 None（新穎性未知）。"""
+    for base in (pathlib.Path(w), pathlib.Path(".")):
+        for fn in ZHIYI_FILES:
+            p = base / fn
+            if p.exists():
+                try:
+                    data = json.load(open(p, encoding="utf-8"))
+                except Exception as e:
+                    print(f"知異索引讀取失敗 {p}: {e}", file=sys.stderr)
+                    return None
+                return [e for e in data if e.get("person")]
+    return None
+
+
+def mark_known(res, index):
+    """給每個人物掛上已被考異述及的條目。只標，不刪。"""
+    hit = 0
+    for p in res:
+        got = []
+        for e in index:
+            if e["person"] != p["person"]:
+                continue
+            bks = {h["book"] for h in p["hits"]}
+            jns = {h["juan"] for h in p["hits"]}
+            if e.get("book") and e["book"] not in bks:
+                continue
+            if e.get("juan") and e["juan"] not in jns:
+                continue
+            got.append(e)
+        if got:
+            hit += 1
+            p["known"] = got
+    return hit
+
+
+# ── 置換檢驗：立場軸是真信號還是巧合 ──────────────────────
+def _flag_kind(k):
+    """旗標的類別名。
+
+    必須把「」裡的立場名與（）裡的行為名都剝掉：否則「僅見於「南朝系」」
+    與「僅見於「北朝系」」會算成兩種信號，置換後的虛無分布隨之碎掉，
+    檢驗就失去意義。
+    """
+    k = re.sub(r"「[^」]*」", "", k)
+    k = re.split(r"[：（(]", k)[0]
+    return k.strip() or "其他"
+
+
+def flag_counts(rows, stances):
+    c = collections.Counter()
+    for p in analyse(rows, stances):
+        for _, k, _ in p["flags"]:
+            c[_flag_kind(k)] += 1
+    return c
+
+
+def cmd_null(a):
+    """把立場標籤在書之間打亂，看各類信號還剩多少。
+
+    立場軸是全部跨立場信號的前提。若打亂標籤後信號量不降，那些信號
+    就不是立場差異造成的 —— 權重也就沒有意義。這是最便宜的一道偽證檢驗，
+    而且不需要金標準。
+    """
+    w = pathlib.Path(a.out)
+    p = w / "findings.json"
+    if not p.exists():
+        sys.exit(f"找不到 {p}（先跑 verify）")
+    data = json.load(open(p, encoding="utf-8"))
+    rows = [h for it in data for h in (it.get("hits") or [])] or data
+    rows = [dict(r) for r in rows if r.get("person") and r.get("book")]
+    if not rows:
+        sys.exit("findings.json 裡沒有可用記載")
+
+    books = sorted({r["book"] for r in rows})
+    by_book = {r["book"]: r["stance"] for r in rows}
+    stances = sorted({r["stance"] for r in rows})
+    if len(stances) < 2:
+        sys.exit("只有一種立場，置換檢驗無意義（立場軸已塌陷）")
+
+    obs = flag_counts(rows, stances)
+    rnd = random.Random(a.seed)
+    labels = [by_book[b] for b in books]
+    null = collections.defaultdict(list)
+    for _ in range(a.iters):
+        sh = labels[:]
+        rnd.shuffle(sh)
+        amap = dict(zip(books, sh))
+        perm = [dict(r, stance=amap[r["book"]]) for r in rows]
+        c = flag_counts(perm, sorted(set(sh)))
+        for k in set(obs) | set(c):
+            null[k].append(c.get(k, 0))
+
+    print(f"置換檢驗　{a.iters} 次　{len(books)} 部書　{len(rows)} 條記載")
+    print(f"立場標籤在書之間打亂（保留書內結構）\n")
+    print(f"{'信號':14s} {'實測':>5s} {'虛無均值':>9s} {'虛無95%':>8s} {'p':>7s}")
+    out = {}
+    for k in sorted(set(obs) | set(null), key=lambda x: -obs.get(x, 0)):
+        v = sorted(null.get(k, [0]))
+        o = obs.get(k, 0)
+        mean = sum(v) / len(v)
+        p95 = v[min(len(v) - 1, int(0.95 * len(v)))]
+        pval = (sum(1 for x in v if x >= o) + 1) / (len(v) + 1)
+        mark = "" if pval > 0.05 else "  *"
+        print(f"{k:14s} {o:5d} {mean:9.2f} {p95:8d} {pval:7.3f}{mark}")
+        out[k] = {"observed": o, "null_mean": mean, "null_p95": p95, "p": pval}
+    _dump(w / "null_test.json", out)
+    print(f"\n* ＝ 打亂後不易出現，立場軸確有貢獻。無星者不可當立場證據引用。")
+    print(f"\n→ {w}/null_test.json", file=sys.stderr)
+
+
 # ── 校驗閘：按偏移重新切片 ────────────────────────────────
 def locate(ev, c):
     """引文在原卷中的絕對地址 (start, end)，不合格返回 None。
@@ -352,7 +584,7 @@ def apply_aliases(rows, amap):
 
 
 # ── 確定性層：矛盾 / 歧異 / 獨載 ──────────────────────────
-def analyse(rows, all_stances):
+def analyse(rows, all_stances, baseline=None):
     people = {}
     for r in rows:
         people.setdefault(r["person"], []).append(r)
@@ -381,22 +613,45 @@ def analyse(rows, all_stances):
                 flags.append((4, f"紀年歧異（{a}）：{' / '.join(sorted(ts))}",
                               "同一事繫於不同時間，考異之常見入口。"))
 
-        # 終局獨載：兩系都記其人，卻只有一系記其死 —— 最強的諱飾信號
+        # 終局獨載：兩系都記其人，卻只有一系記其死 —— 最強的諱飾信號。
+        # 但「不記其死」要能當證據，先得比對該書記同類人之死的正常比率。
         if len(stances) > 1 and term:
             for a in term:
                 who = sorted({h["stance"] for h in hits
                               if a in h.get("acts", [])})
                 silent = [s for s in stances if s not in who]
                 if silent:
-                    flags.append((5, f"終局獨載（{a}）：僅「{'、'.join(who)}」有載",
-                                  f"「{'、'.join(silent)}」記其人而不記其終。"
-                                  f"一方詳其死、另一方諱其死，曲筆之典型。"))
+                    wt = 5
+                    why = (f"「{'、'.join(silent)}」記其人而不記其終。"
+                           f"一方詳其死、另一方諱其死，曲筆之典型。")
+                    sb = sorted({h["book"] for h in hits
+                                 if h.get("stance") in silent})
+                    rs = [(b, baseline[b]["rate"], baseline[b]["n"])
+                          for b in sb
+                          if baseline and b in baseline
+                          and baseline[b].get("rate") is not None]
+                    if rs:
+                        bk, rate, n = max(rs, key=lambda x: x[1])
+                        why += f"\n      基線：《{bk}》對同類人物的終局著錄率 " \
+                               f"{rate:.0%}（n={n}）。"
+                        if rate < 0.3:
+                            wt = 2
+                            why += "該書本就少記終局，沉默不足為奇，權重已下調。"
+                        elif rate >= 0.7:
+                            why += "該書通常記終局，此處沉默確屬異常。"
+                    else:
+                        why += ("\n      無基線可比 —— 跑 `huijian.py baseline` "
+                                "算出該書的正常著錄率再判斷。")
+                    flags.append((wt, f"終局獨載（{a}）：僅「{'、'.join(who)}」有載",
+                                  why))
 
         missing = [s for s in all_stances if s not in stances]
         if len(all_stances) > 1 and missing:
             flags.append((3, f"僅見於「{'、'.join(stances)}」",
                           f"「{'、'.join(missing)}」無載。可能是諱飾，也可能該書本不記此類事，"
-                          f"或材料散佚。需比對同類人物的正常著錄率再判斷。"))
+                          f"或材料散佚。需比對同類人物的正常著錄率再判斷"
+                          f"（`huijian.py baseline` 可算，但目前只算終局著錄率，"
+                          f"不算「是否提及」的著錄率）。"))
 
         if len(hits) > 1 and not flags:
             flags.append((1, "多處互見，無衝突", "記載彼此一致，可作交叉佐證。"))
@@ -413,6 +668,10 @@ def report(res, dropped, fh=sys.stdout, note=""):
         print(f"\n⚠ {note}\n", file=fh)
     for p in res:
         print(f"\n■ {p['person']}　[{'|'.join(p['stances'])}]　權重 {p['score']}", file=fh)
+        for e in p.get("known") or []:
+            src = e.get("source") or "未註明出處"
+            tp = f"（{e['topic']}）" if e.get("topic") else ""
+            print(f"  ◆ 考異已及{tp}：{src}", file=fh)
         for w, k, why in p["flags"]:
             mark = "⚠" if w >= 4 else "·"
             print(f"  {mark} {k}\n      {why}", file=fh)
@@ -619,7 +878,32 @@ def cmd_verify(a):
                 f"  裁定：編輯 {w}/aliases_suggested.json，留下確認的對應，"
                 f'存成 {w}/aliases.json（格式 {{"善明": "劉善明"}}），再跑一次 verify。')
 
-    res = analyse(uniq, sorted({r["stance"] for r in uniq}))
+    base = None
+    bf = w / "baseline.json"
+    if bf.exists():
+        base = json.load(open(bf, encoding="utf-8"))
+        print(f"基線：讀入 {len(base)} 部書的終局著錄率", file=sys.stderr)
+    else:
+        print("提示：尚無基線。跑 `python huijian.py baseline "
+              f"{w}` 可校準終局獨載的權重", file=sys.stderr)
+    res = analyse(uniq, sorted({r["stance"] for r in uniq}), base)
+
+    zy = load_zhiyi(w)
+    if zy is None:
+        nov = ("新穎性未知：未載入知異索引，系統分不清哪條是新發現、"
+               "哪條是前人早已論及。\n"
+               "  **在建起這層掩碼之前，不要據本報告聲稱任何「新發現」。**\n"
+               "  辦法見 docs/06「沒有『已知集合』」一節。")
+        print("\n⚠ " + nov, file=sys.stderr)
+        note = (note + "\n\n" if note else "") + nov
+    else:
+        k = mark_known(res, zy)
+        print(f"知異索引：{len(zy)} 條，命中 {k} 人（報告中以 ◆ 標出）",
+              file=sys.stderr)
+        if k == 0:
+            note = ((note + "\n\n" if note else "")
+                    + f"知異索引 {len(zy)} 條，本次無一命中 —— "
+                      f"或確屬未論及，或索引覆蓋不足，兩者無法由此分辨。")
     _dump(w / "findings.json", res)
     if dropped:
         print(f"攔下 {len(dropped)} 條偽引：", file=sys.stderr)
@@ -653,17 +937,22 @@ def main():
             p.add_argument("--dry-run", action="store_true", help="只列出將發出的請求")
             p.add_argument("--debug", action="store_true", help="逐條列印模型返回與攔截")
         p.set_defaults(fn=fn)
-    for nm, fn in [("expand", cmd_expand), ("verify", cmd_verify)]:
+    for nm, fn in [("expand", cmd_expand), ("verify", cmd_verify),
+                   ("baseline", cmd_baseline), ("null", cmd_null)]:
         q = sub.add_parser(nm)
         q.add_argument("out", help="工作目錄")
         q.add_argument("--window", type=int, default=200)
+        if nm == "null":
+            q.add_argument("--iters", type=int, default=500,
+                           help="置換次數，預設 500")
+            q.add_argument("--seed", type=int, default=0, help="隨機種子，便於復現")
         if nm == "verify":
             q.add_argument("--strict", action="store_true",
                            help="按地址從語料重新切片逐字核對（需 corpus/ 在位）")
         q.set_defaults(fn=fn)
 
     a = ap.parse_args()
-    if a.cmd not in ("fetch", "verify") and not COR.exists():
+    if a.cmd not in ("fetch", "verify", "null") and not COR.exists():
         sys.exit("先跑 python huijian.py fetch")
     a.fn(a)
 

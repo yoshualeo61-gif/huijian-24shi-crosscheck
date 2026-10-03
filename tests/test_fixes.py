@@ -238,6 +238,165 @@ def test_ambiguous_alias_not_suggested():
           str(c["candidates"]))
 
 
+# ── 9. 月份與干支日：現成的強錨，此前一分未得 ────────────────
+def test_month_and_ganzhi_anchors():
+    print("9. 月與干支日錨定")
+    check(duizhao.parse_month_day("二月丁卯") == (2, False, "丁卯"),
+          "二月丁卯", str(duizhao.parse_month_day("二月丁卯")))
+    check(duizhao.parse_month_day("二月，丁卯，虜寇壽陽") == (2, False, "丁卯"),
+          "月與干支間有標點也認得")
+    check(duizhao.parse_month_day("閏二月甲子") == (2, True, "甲子"),
+          "閏月", str(duizhao.parse_month_day("閏二月甲子")))
+    check(duizhao.parse_month_day("春正月乙巳") == (1, False, "乙巳"), "春正月")
+    check(duizhao.parse_month_day("十二月壬戌朔") == (12, False, "壬戌"), "十二月")
+    # 干支只在月份之後近處採信：月前的干支屬別日，不可冒領
+    check(duizhao.parse_month_day("癸卯，詔北伐。二月，丁卯，虜寇壽陽")
+          == (2, False, "丁卯"), "月前的干支不被冒領")
+    check(duizhao.parse_month_day("元嘉二十七年") == (None, False, None),
+          "只有年份時不編造月日")
+
+    rows = [
+        {"person": "垣崇祖", "place": "壽陽", "time": "建元二年", "acts": ["征战"],
+         "evidence": "二月，丁卯，虜寇壽陽，豫州刺史垣崇祖破走之",
+         "book": "南齐书", "juan": "本纪卷二", "stance": "南朝系"},
+        {"person": "垣崇祖", "place": "壽陽", "time": "建元二年", "acts": ["征战"],
+         "evidence": "二月丁卯，魏軍攻壽陽，豫州刺史垣崇祖破走之",
+         "book": "南史", "juan": "卷四", "stance": "唐修"},
+    ]
+    a, b = duizhao.anchors(rows[0]), duizhao.anchors(rows[1])
+    sc, why = duizhao.pair_score(a, b)
+    check(any("同月" in w for w in why), "同月計入錨定", str(why))
+    check(any("同日 丁卯" in w for w in why), "同日計入錨定", str(why))
+    check(sc >= 11, f"錨定分數提高到 {sc}（原為 6）", str(sc))
+
+
+# ── 10. 日次／閏月歧異與改元元年降權 ────────────────────────
+def test_day_divergence_and_era_boundary():
+    print("10. 日次歧異與改元元年降權")
+    mk = lambda bk, ev, t: {"person": "某", "place": "", "acts": [], "time": t,
+                            "evidence": ev, "book": bk, "juan": "一",
+                            "stance": "南朝系" if bk != "魏书" else "北朝系"}
+    ra, rb = mk("南齐书", "二月丁卯，戰", "建元二年"), mk("魏书", "二月己巳，戰", "建元二年")
+    d = duizhao.diverge(ra, rb, duizhao.anchors(ra), duizhao.anchors(rb))
+    check(any(k == "日次歧異" for _, k, _ in d), "同年同月異干支 → 日次歧異",
+          str([k for _, k, _ in d]))
+
+    ra, rb = mk("南齐书", "閏二月丁卯", "建元二年"), mk("魏书", "二月丁卯", "建元二年")
+    d = duizhao.diverge(ra, rb, duizhao.anchors(ra), duizhao.anchors(rb))
+    check(any(k == "閏月歧異" for _, k, _ in d), "閏月之別被標出",
+          str([k for _, k, _ in d]))
+
+    # 差一年又涉改元元年：很可能只是改元月份算法之異，降權
+    ra = mk("南齐书", "x", "建元元年")
+    rb = mk("魏书", "y", "太和三年")
+    aa, ab = duizhao.anchors(ra), duizhao.anchors(rb)
+    check(aa["year"][0] == 479 and ab["year"][0] == 479, "建元元年與太和三年同為 479",
+          f"{aa['year']} {ab['year']}")
+    ra2 = mk("南齐书", "x", "建元元年")
+    rb2 = mk("魏书", "y", "太和四年")                      # 480，差一年
+    d = duizhao.diverge(ra2, rb2, duizhao.anchors(ra2), duizhao.anchors(rb2))
+    yr = [(w, k) for w, k, _ in d if k == "紀年歧異"]
+    check(yr and yr[0][0] == 2, "差一年且一方為改元元年 → 權重降為 2", str(yr))
+
+
+# ── 11. 基線：著錄率低的書，其沉默不得當證據 ────────────────
+def test_baseline_downweights_silence():
+    print("11. 基線校準終局獨載")
+    rows = [
+        {"person": "甲", "acts": ["被杀"], "time": "", "evidence": "甲見殺",
+         "book": "魏书", "juan": "一", "stance": "北朝系"},
+        {"person": "甲", "acts": ["赴任"], "time": "", "evidence": "甲之任",
+         "book": "宋书", "juan": "二", "stance": "南朝系"},
+    ]
+    # 無基線：權重 5，並說明無從比對
+    r0 = huijian.analyse([dict(x) for x in rows], ["南朝系", "北朝系"])
+    f0 = [(w, k) for p in r0 for w, k, _ in p["flags"] if "終局獨載" in k]
+    check(f0 and f0[0][0] == 5, "無基線時權重 5", str(f0))
+
+    # 基線低：宋书本就少記終局，沉默不足為奇 → 降為 2
+    low = {"宋书": {"n": 40, "k": 2, "rate": 0.05}}
+    r1 = huijian.analyse([dict(x) for x in rows], ["南朝系", "北朝系"], low)
+    f1 = [(w, k) for p in r1 for w, k, _ in p["flags"] if "終局獨載" in k]
+    check(f1 and f1[0][0] == 2, "著錄率 5% → 權重降為 2", str(f1))
+
+    # 基線高：沉默確屬異常 → 維持 5
+    high = {"宋书": {"n": 40, "k": 36, "rate": 0.9}}
+    r2 = huijian.analyse([dict(x) for x in rows], ["南朝系", "北朝系"], high)
+    f2 = [(w, k) for p in r2 for w, k, _ in p["flags"] if "終局獨載" in k]
+    check(f2 and f2[0][0] == 5, "著錄率 90% → 維持權重 5", str(f2))
+    why2 = [y for p in r2 for _, k, y in p["flags"] if "終局獨載" in k][0]
+    check("90%" in why2, "基線數字寫進理由，可被指著反駁", why2[:60])
+
+
+def test_terminal_rate_counts():
+    print("11b. 終局著錄率統計")
+    tmp = tempfile.mkdtemp()
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        (pathlib.Path("corpus") / "魏书").mkdir(parents=True)
+        (pathlib.Path("corpus") / "宋书").mkdir(parents=True)
+        # 兩人之間填足距離，否則 window 會把兩人的上下文疊在一起
+        pathlib.Path("corpus/魏书/一.txt").write_text(
+            "甲戍郁洲，後見殺。" + "紀事" * 150 + "乙鎮壽陽，有功，久之去職。",
+            encoding="utf-8")
+        pathlib.Path("corpus/宋书/一.txt").write_text(
+            "甲之任，乙築城。", encoding="utf-8")
+        base = huijian.terminal_rate(["甲", "乙"], window=120)
+
+        # 中間夾著別人時，不得把鄰人的死算到自己頭上
+        (pathlib.Path("corpus") / "北齐书").mkdir(parents=True)
+        pathlib.Path("corpus/北齐书/一.txt").write_text(
+            "丙與乙俱出，乙見殺。", encoding="utf-8")
+        near = huijian.terminal_rate(["丙", "乙"], window=60)
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+    check(base["魏书"]["n"] == 2 and base["魏书"]["k"] == 1,
+          "魏书：提及 2 人，記其終 1 人", str(base["魏书"]))
+    check(abs(base["魏书"]["rate"] - 0.5) < 1e-9, "著錄率 50%",
+          str(base["魏书"]["rate"]))
+    check(base["宋书"]["k"] == 0, "宋书：無終局用語", str(base["宋书"]))
+    check(near["北齐书"]["k"] == 1, "夾著別人時只算得一人",
+          str(near["北齐书"]))
+
+
+# ── 12. 置換檢驗：類別名必須剝掉立場，否則分布會碎掉 ────────
+def test_flag_kind_strips_stance():
+    print("12. 旗標類別名歸併")
+    check(huijian._flag_kind("僅見於「南朝系」") == "僅見於", "剝掉立場名",
+          huijian._flag_kind("僅見於「南朝系」"))
+    check(huijian._flag_kind("僅見於「南朝系」")
+          == huijian._flag_kind("僅見於「北朝系」"),
+          "不同立場歸為同一類（否則虛無分布碎掉）")
+    check(huijian._flag_kind("終局獨載（归降）：僅「北朝系」有載") == "終局獨載",
+          "剝掉行為名與後綴",
+          huijian._flag_kind("終局獨載（归降）：僅「北朝系」有載"))
+    check(huijian._flag_kind("終局互斥：死于战 ↔ 归降") == "終局互斥", "終局互斥")
+    check(huijian._flag_kind("紀年歧異（除授）：480 / 481") == "紀年歧異", "紀年歧異")
+
+
+def test_permutation_is_sensitive():
+    print("12b. 置換檢驗對立場結構敏感")
+    # 甲只見於南朝系兩書，乙只見於北朝系兩書 → 實測兩條「僅見於」
+    rows = []
+    for bk, st, who in [("宋书", "南朝系", "甲"), ("南齐书", "南朝系", "甲"),
+                        ("魏书", "北朝系", "乙"), ("北齐书", "北朝系", "乙")]:
+        rows.append({"person": who, "acts": [], "time": "", "evidence": f"{who}事",
+                     "book": bk, "juan": "一", "stance": st})
+    obs = huijian.flag_counts(rows, ["南朝系", "北朝系"])
+    check(obs["僅見於"] == 2, "實測兩條僅見於", str(dict(obs)))
+
+    # 換成每人各跨兩立場 → 僅見於應歸零
+    amap = {"宋书": "南朝系", "南齐书": "北朝系",
+            "魏书": "北朝系", "北齐书": "南朝系"}
+    perm = [dict(r, stance=amap[r["book"]]) for r in rows]
+    c = huijian.flag_counts(perm, ["南朝系", "北朝系"])
+    check(c["僅見於"] == 0, "重排立場後僅見於歸零", str(dict(c)))
+    check(obs["僅見於"] > c["僅見於"],
+          "檢驗確實對立場結構敏感（否則 p 值毫無意義）")
+
+
 if __name__ == "__main__":
     for t in (test_scan_keeps_parallel_passages,
               test_scan_still_folds_duplicates_within_a_book,
@@ -246,7 +405,13 @@ if __name__ == "__main__":
               test_evidence_gate,
               test_offset_anchoring_rejects_splice,
               test_person_normalization,
-              test_ambiguous_alias_not_suggested):
+              test_ambiguous_alias_not_suggested,
+              test_month_and_ganzhi_anchors,
+              test_day_divergence_and_era_boundary,
+              test_baseline_downweights_silence,
+              test_terminal_rate_counts,
+              test_flag_kind_strips_stance,
+              test_permutation_is_sensitive):
         t()
         print()
     if FAIL:

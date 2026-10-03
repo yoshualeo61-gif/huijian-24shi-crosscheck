@@ -135,6 +135,63 @@ def to_year(text, book=None):
     return None
 
 
+# ── 月份與干支日 ──────────────────────────────────────────
+# 本紀的日期寫法是「某年某月干支」。月與干支在兩書中往往字面完全一致,
+# 是現成的強錨 —— 此前完全沒用上：《南齊書》與《南史》同記「二月丁卯」,
+# 卻一分未得。干支日不換算成公元日（那需要連續曆表），只作字面比對：
+# 同年同月又同干支，兩條幾乎不可能不是同一天。
+GAN = "甲乙丙丁戊己庚辛壬癸"
+ZHI = "子丑寅卯辰巳午未申酉戌亥"
+GANZHI = [GAN[i % 10] + ZHI[i % 12] for i in range(60)]
+GZ_RE = re.compile(f"[{GAN}][{ZHI}]")
+MONTH_RE = re.compile(r"(閏|闰)?([正元一二三四五六七八九十]{1,3})月")
+
+
+def cn_month(s):
+    if s in ("正", "元"):
+        return 1
+    n = cn_num(s)
+    return n if n and 1 <= n <= 12 else None
+
+
+def parse_month_day(text):
+    """回傳 (月, 是否閏月, 干支日)。取不到的部分為 None／False。
+
+    干支只在月份之後近處採信 —— 干支也用於紀年與人名，離開「某月」的
+    上下文就不可靠。寧可取不到，不可取錯。
+    """
+    if not text:
+        return (None, False, None)
+    m = MONTH_RE.search(text)
+    if not m:
+        return (None, False, None)
+    mon, leap = cn_month(m.group(2)), bool(m.group(1))
+    gz = None
+    g = GZ_RE.search(text, m.end(), m.end() + 12)
+    if g:
+        gz = g.group(0)
+    return (mon, leap, gz)
+
+
+def parse_date(row):
+    """解析一條記載的年、月、干支日。
+
+    年取自 time；月與干支日 time 裡沒有就退而從 evidence 取 —— 本紀的
+    evidence 往往自帶完整日期，而抽取出的 time 常只有年號。來源記在
+    date_from，不混淆。
+    """
+    t = row.get("time") or ""
+    y = to_year(t, row.get("book"))
+    mon, leap, gz = parse_month_day(t)
+    src_f = "time" if mon else None
+    if mon is None:
+        mon, leap, gz = parse_month_day(row.get("evidence") or "")
+        src_f = "evidence" if mon else None
+    return {"year": y, "month": mon, "leap": leap, "ganzhi": gz,
+            "date_from": src_f,
+            "first_year": bool(y and y[2] == 1)}
+
+
 # ── 立場用語：同一事，勝方與敗方措辭不同 ──────────────────
 STANCE_LEX = {
     "歸附": ["内附", "內附", "归诚", "歸誠", "来降", "來降", "归化", "歸化",
@@ -153,10 +210,16 @@ def lex_tags(text):
 
 # ── 事件對齊 ──────────────────────────────────────────────
 def anchors(row):
+    d = parse_date(row)
     return {
         "person": row.get("person") or "",
         "place": row.get("place") or "",
-        "year": to_year(row.get("time", ""), row.get("book")),
+        "year": d["year"],
+        "month": d["month"],
+        "leap": d["leap"],
+        "ganzhi": d["ganzhi"],
+        "date_from": d["date_from"],
+        "first_year": d["first_year"],
         "acts": set(row.get("acts") or []),
         "stance": row.get("stance", "?"),
     }
@@ -179,6 +242,14 @@ def pair_score(a, b):
         elif d == 1:
             s += 1
             why.append(f"相鄰年 {a['year'][0]}/{b['year'][0]}")
+    if a["month"] and a["month"] == b["month"] and a["leap"] == b["leap"]:
+        s += 2
+        why.append(f"同月 {'閏' if a['leap'] else ''}{a['month']}月")
+    # 干支日只在同月的前提下才算錨：日干支六十日一輪，離開月份毫無分辨力
+    if (a["ganzhi"] and a["ganzhi"] == b["ganzhi"]
+            and a["month"] and a["month"] == b["month"]):
+        s += 3
+        why.append(f"同日 {a['ganzhi']}")
     if a["acts"] & b["acts"]:
         s += 1
         why.append("行為重疊 " + "、".join(sorted(a["acts"] & b["acts"])))
@@ -189,10 +260,31 @@ def diverge(ra, rb, aa, ab):
     """並置之後，分歧在哪。"""
     out = []
     if aa["year"] and ab["year"] and aa["year"][0] != ab["year"][0]:
-        out.append((5, "紀年歧異",
-                    f"{ra['book']}作{aa['year'][1]}{aa['year'][2]}年"
-                    f"（{aa['year'][0]}）／{rb['book']}作{ab['year'][1]}{ab['year'][2]}年"
-                    f"（{ab['year'][0]}）"))
+        why = (f"{ra['book']}作{aa['year'][1]}{aa['year'][2]}年"
+               f"（{aa['year'][0]}）／{rb['book']}作{ab['year'][1]}{ab['year'][2]}年"
+               f"（{ab['year'][0]}）")
+        wt = 5
+        # 差一年又涉及改元之年：很可能只是改元月份的算法差異，不是歧異。
+        # 本工具不處理月份邊界（見文檔 06），所以這裡降權並說明。
+        if (abs(aa["year"][0] - ab["year"][0]) == 1
+                and (aa["first_year"] or ab["first_year"])):
+            wt = 2
+            why += ("　差一年且一方為改元元年：改元當年前幾個月仍屬舊年號，"
+                    "本工具不處理月份邊界，此條很可能不是真歧異，權重已下調。")
+        out.append((wt, "紀年歧異", why))
+
+    # 同年同月而干支日不同：日次歧異，考異的細處入口
+    if (aa["ganzhi"] and ab["ganzhi"] and aa["ganzhi"] != ab["ganzhi"]
+            and aa["month"] and aa["month"] == ab["month"]
+            and aa["year"] and ab["year"] and aa["year"][0] == ab["year"][0]):
+        out.append((3, "日次歧異",
+                    f"同年同月，{ra['book']}作{aa['ganzhi']}日／"
+                    f"{rb['book']}作{ab['ganzhi']}日。"))
+    # 閏月之別
+    if (aa["month"] and aa["month"] == ab["month"] and aa["leap"] != ab["leap"]):
+        out.append((3, "閏月歧異",
+                    f"{ra['book']}作{'閏' if aa['leap'] else ''}{aa['month']}月／"
+                    f"{rb['book']}作{'閏' if ab['leap'] else ''}{ab['month']}月。"))
 
     ta, tb = lex_tags(ra["evidence"]), lex_tags(rb["evidence"])
     for x, y in OPPOSED:
@@ -258,8 +350,14 @@ def main():
     if a.cmd == "eras":
         for t in a.terms:
             y = to_year(t, a.book)
+            mon, leap, gz = parse_month_day(t)
+            tail = ""
+            if mon:
+                tail += f"　{'閏' if leap else ''}{mon}月"
+            if gz:
+                tail += f"{gz}日"
             if y:
-                print(f"{t:16s} → {y[0]} 年（{y[1]}{y[2]}）")
+                print(f"{t:16s} → {y[0]} 年（{y[1]}{y[2]}）{tail}")
                 continue
             cs = era_candidates(t)
             if not cs:
